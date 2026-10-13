@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/lukashornych/hole/v2/internal/compose"
 	"github.com/lukashornych/hole/v2/internal/config"
 	"github.com/lukashornych/hole/v2/internal/hostenv"
 	"github.com/lukashornych/hole/v2/internal/logging"
@@ -15,34 +17,60 @@ import (
 // mountBuilder accumulates bind mounts for the agent service, keeping one mount per
 // container target so overlapping exclusion patterns cannot produce duplicates.
 type mountBuilder struct {
-	host      hostenv.Host
-	runTmpDir string
-	// mounts is the agent's complete volume list. The three fields below hold no mounts of their
-	// own: each records which of these same strings is *also* mirrored onto the DinD sidecar, so
-	// the sidecar's set is by construction a subset of the agent's — and, since `seen` already
-	// keeps one mount per container target, a set with no duplicate target either.
+	host hostenv.Host
+	// mounts is the agent's complete volume list. The libraries and dockerIncludes fields below,
+	// and the mount strings the masks carry, hold no mounts of their own: each records which of
+	// these same strings is *also* mirrored onto the DinD sidecar, so the sidecar's set is by
+	// construction a subset of the agent's — and, since `seen` already keeps one mount per
+	// container target, a set with no duplicate target either.
 	mounts []string
-	// exclusions are the mounts that hide a path rather than expose one and libraries the library
-	// mounts; both categories are mirrored in full. dockerIncludes is only the subset of
-	// `files.include` entries marked `docker` — a plain include stays off the privileged sidecar.
+	// libraries are the library mounts and dockerIncludes only the subset of `files.include`
+	// entries marked `docker` — a plain include stays off the privileged sidecar. Both are
+	// mirrored onto the sidecar, as are the masks below.
 	//
 	// Mirroring is needed because the daemon resolves `-v` paths in its own filesystem: without it
 	// a nested container gets a silently empty directory. A mirrored `:ro` library stays read-only
 	// because the daemon runs rootless: mounts it inherits into a child user namespace are
 	// MNT_LOCKED, so the kernel refuses to clear MS_RDONLY. The same property is what keeps a
 	// mirrored over-mount from being unmounted — being an over-mount is no boundary on its own.
-	exclusions     []string
 	libraries      []string
 	dockerIncludes []string
-	seen           map[string]bool
+	// masks are every path `files.exclude` hides, in the order they were recorded. It is the one
+	// record of exclusions: the sidecar's mirror, the directory masks of both services, the mask
+	// volume's subpaths and the targets verifyMasks checks are all derived from it, so none of
+	// them can drift from the others.
+	masks []mask
+	seen  map[string]bool
 	// globalExclude is the global `files.exclude` (with the selected profile chain applied). It
 	// is applied to every checkout that is not the project; the project mount gets its patterns
 	// from the merged settings, which already contain the global ones.
 	globalExclude []string
 }
 
-func newMountBuilder(host hostenv.Host, runTmpDir string) *mountBuilder {
-	return &mountBuilder{host: host, runTmpDir: runTmpDir, seen: map[string]bool{}}
+// mask is one path `files.exclude` hides. A file is hidden by a `/dev/null` over-mount, which is
+// an ordinary entry of `mounts` recorded here by its mount string. A directory has no mount
+// string: it is hidden by its own subdirectory of the sandbox's mask volume, `subpath`, or — on
+// an engine that cannot mount volume subpaths — by a tmpfs.
+//
+// Neither directory mask has a host source. A bind whose source is a host path nested inside
+// another host path is torn down about a second after the container starts by Docker Desktop's
+// Docker VMM (libkrun), silently unhiding it; a volume and a tmpfs live inside the VM and
+// survive. The volume is preferred because it is disk-backed: a build writing gigabytes into an
+// excluded `target/` would otherwise fill RAM charged to the container's memory limit.
+type mask struct {
+	target  string
+	mount   string
+	subpath string
+}
+
+// tmpfsMaskOptions are the mount options of every tmpfs mask. The runtime's default for a tmpfs
+// is `noexec,nosuid,nodev`, and an excluded directory like `node_modules` or `target` is where a
+// build puts the binaries it then runs — a `noexec` mask would let the agent write them but not
+// execute them, which the host placeholder the tmpfs replaced never prevented.
+const tmpfsMaskOptions = "exec"
+
+func newMountBuilder(host hostenv.Host) *mountBuilder {
+	return &mountBuilder{host: host, seen: map[string]bool{}}
 }
 
 // add records one mount and reports whether it was kept: a target already mounted wins, so
@@ -60,17 +88,89 @@ func (b *mountBuilder) add(source, target, options string) bool {
 	return true
 }
 
-// addExclusion records an over-mount, which is also mirrored onto the DinD sidecar.
-func (b *mountBuilder) addExclusion(source, target, options string) {
-	if !b.add(source, target, options) {
+// addFileMask records a `/dev/null` over-mount of a file.
+func (b *mountBuilder) addFileMask(target string) {
+	if !b.add("/dev/null", target, "ro") {
 		return
 	}
-	b.exclusions = append(b.exclusions, b.mounts[len(b.mounts)-1])
+	b.masks = append(b.masks, mask{target: target, mount: b.mounts[len(b.mounts)-1]})
 }
 
-// addExclusions hides paths inside sourceDir from the sandbox by over-mounting them:
-// files with /dev/null, directories with an empty host directory (never an anonymous
-// volume — `compose down` leaks those without -v).
+// addDirectoryMask hides a directory behind an empty, writable directory that lives inside the
+// runtime's VM. It claims the same one-per-target slot a mount does, so an exclusion and a mount
+// can never both own a path. The subpath is assigned here, in recording order, so it is the same
+// on every generation of the same inputs.
+//
+// The mask is left writable, as the empty host directory it replaced was: an exclusion like
+// `node_modules` or `target` is routinely written into.
+func (b *mountBuilder) addDirectoryMask(target string) {
+	if b.seen[target] {
+		return
+	}
+	b.seen[target] = true
+	b.masks = append(b.masks, mask{target: target, subpath: strconv.Itoa(len(b.maskSubpaths()))})
+}
+
+// exclusionMounts are the over-mounts that hide files, mirrored in full onto the DinD sidecar.
+func (b *mountBuilder) exclusionMounts() []string {
+	var mounts []string
+	for _, mask := range b.masks {
+		if mask.mount != "" {
+			mounts = append(mounts, mask.mount)
+		}
+	}
+	return mounts
+}
+
+// maskSubpaths are the subdirectories of the mask volume the directory masks mount, which have
+// to exist before any container mounts them.
+func (b *mountBuilder) maskSubpaths() []string {
+	var subpaths []string
+	for _, mask := range b.masks {
+		if mask.mount == "" {
+			subpaths = append(subpaths, mask.subpath)
+		}
+	}
+	return subpaths
+}
+
+// volumeMasks are the directory masks as subpath mounts of the mask volume, for the agent and the
+// sidecar alike.
+func (b *mountBuilder) volumeMasks(volume string) []compose.ServiceVolume {
+	var entries []compose.ServiceVolume
+	for _, mask := range b.masks {
+		if mask.mount == "" {
+			entries = append(entries, compose.ServiceVolume{Source: volume, Target: mask.target, Subpath: mask.subpath})
+		}
+	}
+	return entries
+}
+
+// tmpfsMasks are the directory masks as entries of the compose `tmpfs` key, `<path>:<options>`,
+// for the agent and the sidecar alike — the fallback for an engine that cannot mount volume
+// subpaths. Their pages are charged to the container's memory cgroup.
+func (b *mountBuilder) tmpfsMasks() []string {
+	var entries []string
+	for _, mask := range b.masks {
+		if mask.mount == "" {
+			entries = append(entries, mask.target+":"+tmpfsMaskOptions)
+		}
+	}
+	return entries
+}
+
+// maskTargets are the container paths every exclusion hides, whichever mechanism hides them,
+// for verifyMasks to assert once the container is up.
+func (b *mountBuilder) maskTargets() []string {
+	var targets []string
+	for _, mask := range b.masks {
+		targets = append(targets, mask.target)
+	}
+	return targets
+}
+
+// addExclusions hides paths inside sourceDir from the sandbox: files are over-mounted with
+// /dev/null, directories are masked by addDirectoryMask.
 func (b *mountBuilder) addExclusions(sourceDir, mountPoint string, entries []string) error {
 	var resolved []string
 	for _, raw := range entries {
@@ -114,14 +214,10 @@ func (b *mountBuilder) addExclusions(sourceDir, mountPoint string, entries []str
 		}
 		target := mountPoint + "/" + relative
 		if info.IsDir() {
-			emptyDir := filepath.Join(b.runTmpDir, "excluded-dirs", mountPoint, relative)
-			if err := os.MkdirAll(emptyDir, 0o755); err != nil {
-				return fmt.Errorf("create placeholder for excluded directory '%s': %w", relative, err)
-			}
-			b.addExclusion(emptyDir, target, "")
+			b.addDirectoryMask(target)
 			continue
 		}
-		b.addExclusion("/dev/null", target, "ro")
+		b.addFileMask(target)
 	}
 	return nil
 }

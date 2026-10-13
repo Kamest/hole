@@ -74,6 +74,11 @@ func Teardown(containerEngine *engine.Engine, host hostenv.Host, store *state.St
 			logging.Warn("could not remove Docker-in-Docker volume %s", instance.DinDVolume)
 		}
 	}
+	if instance.MaskVolume != "" {
+		if err := containerEngine.VolumeRemove(instance.MaskVolume); err != nil && containerEngine.VolumeExists(instance.MaskVolume) {
+			logging.Warn("could not remove mask volume %s", instance.MaskVolume)
+		}
+	}
 
 	// One answer for both consumers, taken while this instance is still registered: Hole's own
 	// shared infrastructure below, and the user's cleanupHost hooks after it.
@@ -192,6 +197,9 @@ func verifyRemoved(containerEngine *engine.Engine, instance *state.Instance) {
 	}
 	if instance.DinDVolume != "" && containerEngine.VolumeExists(instance.DinDVolume) {
 		leftovers = append(leftovers, "volume "+instance.DinDVolume)
+	}
+	if instance.MaskVolume != "" && containerEngine.VolumeExists(instance.MaskVolume) {
+		leftovers = append(leftovers, "volume "+instance.MaskVolume)
 	}
 	if len(leftovers) == 0 {
 		logging.Debug("instance %s fully removed", instance.InstanceName)

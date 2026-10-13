@@ -116,7 +116,9 @@ func AgentRepository(projectName string) string {
 	return AgentRepositoryPrefix + projectName
 }
 
-// GatewayImage is the gateway image reference for a given embedded-assets digest.
+// GatewayImage is the gateway image reference for a given embedded-assets digest. It is also
+// Hole's helper image — every host helper that needs a shell runs over it — because it is built
+// locally, content-pinned and present before any other service starts.
 //
 // The tag is content-derived for the same reason the agent tag is: the gateway's Dockerfile and
 // entrypoint ship inside the binary, so a Hole release can change them, and compose never

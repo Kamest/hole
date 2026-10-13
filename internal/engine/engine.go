@@ -119,6 +119,13 @@ func (e *Engine) RunQuiet(args ...string) error {
 	return err
 }
 
+// Exec runs a command inside a running container and captures its stdout. It is the only way
+// to learn what the container's own kernel view is: `inspect` reports the configuration the
+// runtime was given, which can outlive what the container actually has mounted.
+func (e *Engine) Exec(container string, args ...string) (string, error) {
+	return e.output(append([]string{"exec", container}, args...)...)
+}
+
 // ComposeUp starts services from a generated compose file.
 func (e *Engine) ComposeUp(project, file, projectDir string, build bool, services ...string) error {
 	args := []string{"compose", "-p", project, "--project-directory", projectDir, "-f", file, "up", "-d"}
@@ -209,6 +216,66 @@ func (e *Engine) RunHostHelper(image, entrypoint string, args ...string) (string
 		return stdout.String(), -1, err
 	}
 	return stdout.String(), 0, nil
+}
+
+// RunVolumeHelper runs a one-shot shell script in a named container with no network and the given
+// `--mount` specs, for volume maintenance the CLI cannot do on a volume it has no path to. The
+// name lets garbage collection sweep a helper whose run was interrupted; the image's own
+// entrypoint is bypassed. It fails when the container could not run, the script failed, or it
+// did not finish within hostHelperTimeout.
+func (e *Engine) RunVolumeHelper(name, image string, mounts []string, script string, args ...string) error {
+	runArgs := []string{"run", "--rm", "--name", name, "--network", "none", "--entrypoint", "sh"}
+	for _, mount := range mounts {
+		runArgs = append(runArgs, "--mount", mount)
+	}
+	runArgs = append(runArgs, image, "-c", script, "sh")
+	runArgs = append(runArgs, args...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), hostHelperTimeout)
+	defer cancel()
+	start := time.Now()
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, e.Binary, runArgs...)
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	logging.Debug("engine: %s %s (%s)", e.Binary, strings.Join(runArgs, " "), time.Since(start).Round(time.Millisecond))
+	if ctx.Err() != nil {
+		_ = e.ContainerRemove(name)
+		return fmt.Errorf("%s %s: timed out after %s", e.Binary, strings.Join(runArgs, " "), hostHelperTimeout)
+	}
+	if err != nil {
+		return fmt.Errorf("%s %s: %w: %s", e.Binary, strings.Join(runArgs, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// VolumeSubpathMount is the `--mount` spec of one subdirectory of a named volume. Docker spells
+// the option `volume-subpath`, podman `subpath`.
+func (e *Engine) VolumeSubpathMount(volume, subpath, target string) string {
+	option := "subpath"
+	if e.IsDocker() {
+		option = "volume-subpath"
+	}
+	return "type=volume,src=" + volume + ",dst=" + target + "," + option + "=" + subpath
+}
+
+// ComposeVersion is the compose plugin's version as it reports it, e.g. `2.26.1` or
+// `v2.26.1-desktop.1`.
+func (e *Engine) ComposeVersion() (string, error) {
+	out, err := e.output("compose", "version", "--short")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// ServerVersion is the container engine's own version, or "" when it cannot be read.
+func (e *Engine) ServerVersion() string {
+	out, err := e.output("version", "--format", "{{.Server.Version}}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
 }
 
 // NetworkRemove removes a network.

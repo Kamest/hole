@@ -25,10 +25,14 @@ services:
         volumes:
             - <PROJECT>:<PROJECT>
             - /dev/null:<PROJECT>/.env:ro
-            - <RUN>/excluded-dirs<PROJECT>/secrets:<PROJECT>/secrets
             - /dev/null:<PROJECT>/config/app.yaml:ro
             - <INCLUDE>:/home/dev/.m2/settings.xml
             - <LIBRARY>:/libs/shared:ro
+            - type: volume
+              source: hole-sandbox-masks-hole-sandbox-demo-abcd1234-xyz123
+              target: <PROJECT>/secrets
+              volume:
+                subpath: "0"
         networks:
             sandbox: {}
         dns:
@@ -72,8 +76,12 @@ services:
             - <LIBRARY>:/libs/shared:ro
             - <INCLUDE>:/home/dev/.m2/settings.xml
             - /dev/null:<PROJECT>/.env:ro
-            - <RUN>/excluded-dirs<PROJECT>/secrets:<PROJECT>/secrets
             - /dev/null:<PROJECT>/config/app.yaml:ro
+            - type: volume
+              source: hole-sandbox-masks-hole-sandbox-demo-abcd1234-xyz123
+              target: <PROJECT>/secrets
+              volume:
+                subpath: "0"
         networks:
             sandbox: {}
         dns:
@@ -134,6 +142,8 @@ services:
         restart: on-failure
 volumes:
     hole-sandbox-docker-data-hole-sandbox-demo-abcd1234-xyz123:
+        external: true
+    hole-sandbox-masks-hole-sandbox-demo-abcd1234-xyz123:
         external: true
 networks:
     internet:

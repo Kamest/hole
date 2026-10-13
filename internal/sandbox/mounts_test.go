@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/lukashornych/hole/v2/internal/compose"
 	"github.com/lukashornych/hole/v2/internal/config"
 	"github.com/lukashornych/hole/v2/internal/hostenv"
 	"github.com/lukashornych/hole/v2/internal/worktree"
@@ -122,7 +123,7 @@ func TestMergeLibrariesResolvesSpellingsOfTheSameDirectory(t *testing.T) {
 		t.Fatalf("two spellings of %s produced %d entries: %v", libraryDir, len(libraries), libraries)
 	}
 
-	builder := newMountBuilder(host, t.TempDir())
+	builder := newMountBuilder(host)
 	if err := builder.addLibraries(libraries, host.Home); err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +190,7 @@ func TestPoolIsASingleReadWriteMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	builder := newMountBuilder(host, t.TempDir())
+	builder := newMountBuilder(host)
 	if err := builder.addLibraries(libraries, projectDir); err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +210,7 @@ func TestPoolIsASingleReadWriteMount(t *testing.T) {
 func TestPoolWorktreeExclusionsComeFromEachWorktreesOwnSettings(t *testing.T) {
 	host, projectDir, poolDir, hiding, plain := poolFixture(t)
 
-	builder := newMountBuilder(host, t.TempDir())
+	builder := newMountBuilder(host)
 	// The same order generateCompose uses: project exclusions, libraries (the pool), then the
 	// over-mounts inside the pool.
 	if err := builder.addExclusions(projectDir, projectDir, []string{".env"}); err != nil {
@@ -237,8 +238,8 @@ func TestPoolWorktreeExclusionsComeFromEachWorktreesOwnSettings(t *testing.T) {
 			builder.mounts, want)
 	}
 	// Over-mounts inside the pool must reach the sidecar too, or `docker build` there sees the file.
-	if !reflect.DeepEqual(builder.exclusions, []string{want[0], want[2]}) {
-		t.Errorf("exclusions = %v, want both over-mounts mirrored onto the sidecar", builder.exclusions)
+	if got := builder.exclusionMounts(); !reflect.DeepEqual(got, []string{want[0], want[2]}) {
+		t.Errorf("exclusionMounts = %v, want both over-mounts mirrored onto the sidecar", got)
 	}
 }
 
@@ -263,7 +264,7 @@ func TestLibraryExclusionsSurviveOnItsOwnMount(t *testing.T) {
 		}
 	}
 
-	builder := newMountBuilder(host, t.TempDir())
+	builder := newMountBuilder(host)
 	if err := builder.addLibraries(
 		map[string]config.Library{libraryDir: {Path: libraryDir}}, host.Home); err != nil {
 		t.Fatal(err)
@@ -326,7 +327,7 @@ func libraryFixture(t *testing.T, settingsContent string) (hostenv.Host, string)
 func TestLibraryGetsGlobalExclusions(t *testing.T) {
 	host, libraryDir := libraryFixture(t, "")
 
-	builder := newMountBuilder(host, t.TempDir())
+	builder := newMountBuilder(host)
 	builder.globalExclude = []string{".env"}
 	if err := builder.addLibraries(
 		map[string]config.Library{libraryDir: {Path: libraryDir}}, host.Home); err != nil {
@@ -348,8 +349,7 @@ func TestLibraryCombinesGlobalAndOwnExclusions(t *testing.T) {
 	host, libraryDir := libraryFixture(t,
 		`{"files": {"exclude": ["secrets"]}, "libraries": {"/somewhere/else": "/libs/nested"}}`)
 
-	runTmpDir := t.TempDir()
-	builder := newMountBuilder(host, runTmpDir)
+	builder := newMountBuilder(host)
 	builder.globalExclude = []string{".env"}
 	if err := builder.addLibraries(
 		map[string]config.Library{libraryDir: {Path: libraryDir}}, host.Home); err != nil {
@@ -359,11 +359,28 @@ func TestLibraryCombinesGlobalAndOwnExclusions(t *testing.T) {
 	want := []string{
 		libraryDir + ":" + libraryDir + ":ro",
 		"/dev/null:" + filepath.Join(libraryDir, ".env") + ":ro",
-		filepath.Join(runTmpDir, "excluded-dirs", libraryDir, "secrets") + ":" +
-			filepath.Join(libraryDir, "secrets"),
 	}
 	if !reflect.DeepEqual(builder.mounts, want) {
 		t.Errorf("mounts = %v, want %v", builder.mounts, want)
+	}
+	// The excluded directory is a directory mask, so it is not in the bind list at all — but it
+	// is still an exclusion, and both kinds must reach the check and the sidecar. As a volume
+	// mask it is its own subpath; as the tmpfs fallback it is executable, because the directories
+	// people exclude are where builds put the binaries they run.
+	wantVolumeMasks := []compose.ServiceVolume{{Source: "masks", Target: filepath.Join(libraryDir, "secrets"), Subpath: "0"}}
+	if got := builder.volumeMasks("masks"); !reflect.DeepEqual(got, wantVolumeMasks) {
+		t.Errorf("volumeMasks = %v, want %v", got, wantVolumeMasks)
+	}
+	if got := builder.maskSubpaths(); !reflect.DeepEqual(got, []string{"0"}) {
+		t.Errorf("maskSubpaths = %v, want the one directory mask", got)
+	}
+	wantMasks := []string{filepath.Join(libraryDir, "secrets") + ":exec"}
+	if got := builder.tmpfsMasks(); !reflect.DeepEqual(got, wantMasks) {
+		t.Errorf("tmpfsMasks = %v, want %v", got, wantMasks)
+	}
+	wantTargets := []string{filepath.Join(libraryDir, ".env"), filepath.Join(libraryDir, "secrets")}
+	if got := builder.maskTargets(); !reflect.DeepEqual(got, wantTargets) {
+		t.Errorf("maskTargets = %v, want %v", got, wantTargets)
 	}
 }
 
@@ -372,7 +389,7 @@ func TestLibraryCombinesGlobalAndOwnExclusions(t *testing.T) {
 func TestLibraryDeduplicatesGlobalAndOwnExclusion(t *testing.T) {
 	host, libraryDir := libraryFixture(t, `{"files": {"exclude": [".env"]}}`)
 
-	builder := newMountBuilder(host, t.TempDir())
+	builder := newMountBuilder(host)
 	builder.globalExclude = []string{".env"}
 	if err := builder.addLibraries(
 		map[string]config.Library{libraryDir: {Path: libraryDir}}, host.Home); err != nil {
@@ -383,8 +400,8 @@ func TestLibraryDeduplicatesGlobalAndOwnExclusion(t *testing.T) {
 	if want := []string{libraryDir + ":" + libraryDir + ":ro", overMount}; !reflect.DeepEqual(builder.mounts, want) {
 		t.Errorf("mounts = %v, want %v", builder.mounts, want)
 	}
-	if want := []string{overMount}; !reflect.DeepEqual(builder.exclusions, want) {
-		t.Errorf("exclusions = %v, want the over-mount mirrored exactly once", builder.exclusions)
+	if got, want := builder.exclusionMounts(), []string{overMount}; !reflect.DeepEqual(got, want) {
+		t.Errorf("exclusionMounts = %v, want the over-mount mirrored exactly once", got)
 	}
 }
 
@@ -400,7 +417,7 @@ func TestProjectExclusionsStillDoNotReachLibraries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	builder := newMountBuilder(host, t.TempDir())
+	builder := newMountBuilder(host)
 	if err := builder.addExclusions(projectDir, projectDir, []string{"config/*.yaml"}); err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +440,7 @@ func TestProjectExclusionsStillDoNotReachLibraries(t *testing.T) {
 func TestPoolWorktreesGetGlobalExclusions(t *testing.T) {
 	host, projectDir, poolDir, hiding, plain := poolFixture(t)
 
-	builder := newMountBuilder(host, t.TempDir())
+	builder := newMountBuilder(host)
 	builder.globalExclude = []string{".env"}
 	libraries, err := mergeLibraries(host, projectDir, nil,
 		[]worktree.Link{{HostPath: poolDir, ReadWrite: true}}, nil)

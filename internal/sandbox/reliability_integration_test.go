@@ -82,6 +82,10 @@ func fabricate(t *testing.T, containerEngine *engine.Engine, store *state.Store,
 		if err := containerEngine.VolumeCreate(instance.DinDVolume, labels); err != nil {
 			t.Fatalf("create volume: %v", err)
 		}
+		instance.MaskVolume = maskVolumePrefix + instanceName
+		if err := containerEngine.VolumeCreate(instance.MaskVolume, labels); err != nil {
+			t.Fatalf("create mask volume: %v", err)
+		}
 	}
 	if err := store.Write(instance); err != nil {
 		t.Fatal(err)
@@ -93,6 +97,9 @@ func fabricate(t *testing.T, containerEngine *engine.Engine, store *state.Store,
 		}
 		if instance.DinDVolume != "" {
 			_ = containerEngine.VolumeRemove(instance.DinDVolume)
+		}
+		if instance.MaskVolume != "" {
+			_ = containerEngine.VolumeRemove(instance.MaskVolume)
 		}
 		store.Remove(instanceName)
 	})
@@ -126,6 +133,9 @@ func TestTeardownRemovesEverythingItOwns(t *testing.T) {
 	}
 	if containerEngine.VolumeExists(instance.DinDVolume) {
 		t.Errorf("volume %s survived teardown", instance.DinDVolume)
+	}
+	if containerEngine.VolumeExists(instance.MaskVolume) {
+		t.Errorf("mask volume %s survived teardown", instance.MaskVolume)
 	}
 	if store.Exists(instance.InstanceName) {
 		t.Error("the instance is still registered after teardown")
@@ -254,6 +264,9 @@ func TestGCKeepsRegisteredInstanceResources(t *testing.T) {
 	if !containerEngine.VolumeExists(instance.DinDVolume) {
 		t.Error("GC removed the volume of a registered instance")
 	}
+	if !containerEngine.VolumeExists(instance.MaskVolume) {
+		t.Error("GC removed the mask volume of a registered instance")
+	}
 	if _, err := os.Stat(instance.RunTmpDir); err != nil {
 		t.Error("GC removed the run directory of a registered instance")
 	}
@@ -264,16 +277,23 @@ func TestGCCollectsOrphanedVolume(t *testing.T) {
 	host, store := testHostAndStore(t)
 
 	// A volume whose instance has no state file, no network and no container is an orphan.
-	orphan := dindVolumePrefix + "hole-sandbox-itest-00000000-orph00"
-	if err := containerEngine.VolumeCreate(orphan, map[string]string{engine.LabelManaged: "true"}); err != nil {
-		t.Fatalf("create volume: %v", err)
+	orphans := []string{
+		dindVolumePrefix + "hole-sandbox-itest-00000000-orph00",
+		maskVolumePrefix + "hole-sandbox-itest-00000000-orph00",
 	}
-	t.Cleanup(func() { _ = containerEngine.VolumeRemove(orphan) })
+	for _, orphan := range orphans {
+		if err := containerEngine.VolumeCreate(orphan, map[string]string{engine.LabelManaged: "true"}); err != nil {
+			t.Fatalf("create volume: %v", err)
+		}
+		t.Cleanup(func() { _ = containerEngine.VolumeRemove(orphan) })
+	}
 
 	GC(containerEngine, host, store)
 
-	if containerEngine.VolumeExists(orphan) {
-		t.Error("orphaned Docker-in-Docker volume was not collected")
+	for _, orphan := range orphans {
+		if containerEngine.VolumeExists(orphan) {
+			t.Errorf("orphaned volume %s was not collected", orphan)
+		}
 	}
 }
 

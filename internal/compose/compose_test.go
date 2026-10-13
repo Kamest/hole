@@ -12,7 +12,7 @@ func TestMarshalEscapesInterpolation(t *testing.T) {
 				Image:       "hole-sandbox/agent-demo:abc",
 				Command:     []string{"/home/dev/.nvm/versions/node/v22/bin/node", "--flag=$VALUE"},
 				Environment: []string{"TOKEN=${SECRET}"},
-				Volumes:     []string{"/host/$dir:/container/$dir"},
+				Volumes:     Binds("/host/$dir:/container/$dir"),
 				Build:       &Build{Context: "/ctx", Args: map[string]string{"EXTRA_PACKAGES": "a$b"}},
 			},
 		},
@@ -91,5 +91,28 @@ func TestMarshalServiceNetworkForms(t *testing.T) {
 	}
 	if !strings.Contains(out, "internet: {}") {
 		t.Errorf("address-less network attachment should marshal as an empty mapping:\n%s", out)
+	}
+}
+
+// A subpath mount has no short form, so it is written in the long form — next to short-form
+// entries in the same list — and its values are escaped like every other string.
+func TestMarshalWritesASubpathVolumeInTheLongForm(t *testing.T) {
+	data, err := Marshal(&File{Services: map[string]*Service{"agent": {Volumes: []ServiceVolume{
+		{Spec: "/project:/project"},
+		{Source: "masks", Target: "/project/$secrets", Subpath: "0"},
+	}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `        volumes:
+            - /project:/project
+            - type: volume
+              source: masks
+              target: /project/$$secrets
+              volume:
+                subpath: "0"
+`
+	if !strings.Contains(string(data), want) {
+		t.Errorf("expected\n%s\nin generated compose file:\n%s", want, data)
 	}
 }

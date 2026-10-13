@@ -127,8 +127,11 @@ installer names it, because that one keeps answering and the install would look 
 Upgrading from 1.x is not just this command: exit your running sandboxes and uninstall 1.x first —
 see [upgrading](MIGRATION.md#upgrading).
 
-Requirements: **docker or podman with the compose plugin**. That is all — Hole embeds
-everything else it needs.
+Requirements: **docker or podman with the compose plugin** — Docker Engine 26+ with Compose 2.26+
+(any current Docker Desktop, OrbStack, Colima or Rancher Desktop), or Podman with volume `subpath`
+support. That is all — Hole embeds everything else it needs. An older engine still works, but
+[excluded directories](#file-exclusions) are then held in memory instead of on disk, and Hole warns
+about it on every start.
 
 Supported platforms: Linux (amd64/arm64, including WSL) and macOS (Intel/Apple Silicon).
 
@@ -170,6 +173,13 @@ it.
 
 Hole works with Docker Desktop, OrbStack, Colima, Rancher Desktop and rootless Podman. Set
 `HOLE_RUNTIME=podman` to force a runtime when both are installed.
+
+On macOS with Docker Desktop's **Docker VMM** (libkrun), keep Hole up to date. That virtual
+machine manager drops nested mounts about a second after a container starts, and Hole used one to
+hide every excluded *directory* — so on those versions `files.exclude` silently exposed them.
+Directories are now hidden with a per-sandbox Docker volume the VMM does not touch, and every
+excluded path is verified inside the container as soon as it is up. On an older Hole, switch Settings →
+General → Virtual Machine Options to the **Apple Virtualization framework** instead.
 
 The sandbox network is created from Hole's own address pool (`10.222.0.0/16` by default), so
 Docker's default pools stay untouched. If that range collides with a VPN or LAN of yours, see
@@ -431,7 +441,13 @@ Hide files and directories from the agent:
 }
 ```
 
-Files are replaced with `/dev/null` and directories with an empty directory, so the agent sees nothing. Patterns support `*`, `?`, `[...]` and `**` (recursive). Exclusions are mirrored onto the Docker-in-Docker sidecar, so a container started inside the sandbox cannot bind-mount its way to them either.
+Files are replaced with `/dev/null` and directories with an empty directory from a Docker volume the sandbox owns (`hole-sandbox-masks-<instance>`, one per sandbox), so the agent sees nothing. Nothing is copied, moved or deleted on your disk. Patterns support `*`, `?`, `[...]` and `**` (recursive). Exclusions are mirrored onto the Docker-in-Docker sidecar, so a container started inside the sandbox cannot bind-mount its way to them either.
+
+Anything the agent writes **into** an excluded directory lands in that volume and is gone when the sandbox exits — the real directory on your disk is never touched. It is writable and executable, so a build that fills an excluded `node_modules` or `target` and runs the binaries it put there works as before. The volume lives on Docker's disk — on macOS that is the Docker VM's disk image, not your Mac's — so several sandboxes each writing a multi-gigabyte `target` need room there.
+
+On an engine older than Docker Engine 26 / Compose 2.26, which cannot mount part of a volume, Hole falls back to an in-memory filesystem (tmpfs) for excluded directories and prints a warning saying so. Everything above still holds, except that what the agent writes into an excluded directory then counts against the container's memory, which `container.memoryLimit` bounds — a build that writes gigabytes there needs a limit sized for it, or an engine update.
+
+As soon as the container is up, and before your terminal is attached to it, Hole checks inside the container that every excluded path is really hidden, and refuses the sandbox if one is not. The check runs once, right after creation. A container runtime can accept a mount and then drop it a moment later — Docker Desktop's **Docker VMM** (libkrun) does that to nested mounts — and from the outside such a sandbox looks perfectly healthy while the agent reads what you meant to hide. If the refusal ever names paths on macOS, switching Docker Desktop to Settings → General → Virtual Machine Options → **Apple Virtualization framework** is the known workaround.
 
 Three things to know about how patterns are matched:
 

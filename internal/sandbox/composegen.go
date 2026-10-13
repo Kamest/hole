@@ -60,13 +60,17 @@ type composeInput struct {
 	// globalExclude is the global `files.exclude` (global file plus the global overlays of the
 	// selected profile chain), applied to every checkout that is not the project. The project
 	// mount is covered by `settings`, which already merges the global patterns in.
-	globalExclude  []string
-	host           hostenv.Host
-	startupAgent   *agents.Agent
-	enabledAgents  []*agents.Agent
-	policy         network.Policy
-	dockerEnabled  bool
-	dindVolume     string
+	globalExclude []string
+	host          hostenv.Host
+	startupAgent  *agents.Agent
+	enabledAgents []*agents.Agent
+	policy        network.Policy
+	dockerEnabled bool
+	dindVolume    string
+	// maskVolume is the sandbox's mask volume, whose subdirectories hide excluded directories.
+	// Empty means the engine cannot mount volume subpaths, and directories are masked with a
+	// tmpfs instead.
+	maskVolume     string
 	registryMirror string
 	// gitLayout is what the project's git worktree layout implies: the libraries to mount and,
 	// in pool mode, the pool directory (already created on the host by then).
@@ -78,43 +82,64 @@ type composeInput struct {
 	opts        Options
 }
 
-// generateCompose writes the single compose file for this run and returns its path.
-func generateCompose(in composeInput) (string, error) {
+// maskPlan is what the generated compose file expects of the sandbox's masks: the container paths
+// every exclusion hides, which verifyMasks asserts once the sandbox is up, and the subdirectories
+// of the mask volume the directory masks mount, which must exist before any service starts. The
+// subpaths are listed whether or not the file uses the volume, so a caller can tell whether there
+// are directory masks at all.
+type maskPlan struct {
+	targets  []string
+	subpaths []string
+}
+
+// generateCompose writes the single compose file for this run and returns its path together
+// with its maskPlan.
+func generateCompose(in composeInput) (string, maskPlan, error) {
 	// The project mount is added separately: both the agent and the DinD sidecar need it
 	// first, while everything the builder collects is shared between them verbatim.
 	projectMount := in.projectDir() + ":" + in.projectDir()
-	mounts := newMountBuilder(in.host, in.runTmpDir)
+	mounts := newMountBuilder(in.host)
 	mounts.globalExclude = in.globalExclude
 	mounts.seen[in.projectDir()] = true
 	if err := mounts.addExclusions(in.projectDir(), in.projectDir(), in.settings.Files.Exclude); err != nil {
-		return "", err
+		return "", maskPlan{}, err
 	}
 	if err := mounts.addIncludes(in.settings.Files.Include, in.projectDir()); err != nil {
-		return "", err
+		return "", maskPlan{}, err
 	}
 	libraries, err := mergeLibraries(in.host, in.projectDir(), in.settings.Libraries, in.gitLayout.Links, in.opts.Libraries)
 	if err != nil {
-		return "", err
+		return "", maskPlan{}, err
 	}
 	if err := mounts.addLibraries(libraries, in.projectDir()); err != nil {
-		return "", err
+		return "", maskPlan{}, err
 	}
 	// After the libraries, so the pool mount is recorded before the over-mounts inside it.
 	if err := mounts.addPoolWorktreeExclusions(in.gitLayout.PoolWorktrees); err != nil {
-		return "", err
+		return "", maskPlan{}, err
 	}
 	for _, link := range in.gitLayout.Links {
 		logging.Debug("git worktree library: %s (read-write=%v)", link.HostPath, link.ReadWrite)
 	}
 
-	agentVolumes := append([]string{projectMount}, mounts.mounts...)
+	agentVolumes := compose.Binds(append([]string{projectMount}, mounts.mounts...)...)
 	if in.hasPrestart {
-		agentVolumes = append(agentVolumes, in.prestartDir+":/tmp/prestart-scripts:ro")
+		agentVolumes = append(agentVolumes, compose.Binds(in.prestartDir+":/tmp/prestart-scripts:ro")...)
 	}
+	// The directory masks go last, after every mount that can contain one. Exactly one of the
+	// two forms is non-empty.
+	var volumeMasks []compose.ServiceVolume
+	var tmpfsMasks []string
+	if in.maskVolume != "" {
+		volumeMasks = mounts.volumeMasks(in.maskVolume)
+	} else {
+		tmpfsMasks = mounts.tmpfsMasks()
+	}
+	agentVolumes = append(agentVolumes, volumeMasks...)
 
 	command, err := agentCommand(in)
 	if err != nil {
-		return "", err
+		return "", maskPlan{}, err
 	}
 
 	labels := resourceLabels(in.instanceName, in.projectName)
@@ -168,11 +193,11 @@ func generateCompose(in composeInput) (string, error) {
 		Environment: []string{
 			"HOLE_SANDBOX_SUBNET=" + in.sandboxNetwork.subnet.String(),
 		},
-		Volumes: []string{
-			filepath.Join(in.gatewayConfDir, "Corefile") + ":/etc/hole/Corefile:ro",
-			filepath.Join(in.gatewayConfDir, "dnsmasq.conf") + ":/etc/hole/dnsmasq.conf:ro",
-			filepath.Join(in.gatewayConfDir, "nftables.rules") + ":/etc/hole/nftables.rules:ro",
-		},
+		Volumes: compose.Binds(
+			filepath.Join(in.gatewayConfDir, "Corefile")+":/etc/hole/Corefile:ro",
+			filepath.Join(in.gatewayConfDir, "dnsmasq.conf")+":/etc/hole/dnsmasq.conf:ro",
+			filepath.Join(in.gatewayConfDir, "nftables.rules")+":/etc/hole/nftables.rules:ro",
+		),
 		ExtraHosts: []string{"host.internal:host-gateway"},
 		Networks: map[string]*compose.ServiceNetwork{
 			"sandbox":  {IPv4Address: in.gatewayIP},
@@ -209,6 +234,7 @@ func generateCompose(in composeInput) (string, error) {
 		Command:     command,
 		Environment: agentEnv,
 		Volumes:     agentVolumes,
+		Tmpfs:       tmpfsMasks,
 		DNS:         []string{in.gatewayIP, "127.0.0.11"},
 		CapAdd:      []string{"NET_ADMIN"},
 		Networks: map[string]*compose.ServiceNetwork{
@@ -250,10 +276,12 @@ func generateCompose(in composeInput) (string, error) {
 		//
 		// Exclusions must come last: a library with its own .hole/settings.json contributes
 		// over-mounts *inside* its mount point, and the parent bind has to be emitted first or
-		// it would land on top of them and unhide the excluded paths.
+		// it would land on top of them and unhide the excluded paths. The tmpfs fallback carries
+		// no such ordering — it lives in its own compose key, and the runtime sorts mounts by
+		// destination, so a mask always lands on top of the bind that contains it.
 		dindVolumes = append(dindVolumes, mounts.libraries...)
 		dindVolumes = append(dindVolumes, mounts.dockerIncludes...)
-		dindVolumes = append(dindVolumes, mounts.exclusions...)
+		dindVolumes = append(dindVolumes, mounts.exclusionMounts()...)
 
 		dindCommand := []string{}
 		if in.registryMirror != "" {
@@ -270,7 +298,8 @@ func generateCompose(in composeInput) (string, error) {
 			Entrypoint:  []string{"sh", "-c", dindEntrypoint, "--"},
 			Command:     dindCommand,
 			Environment: dindEnv,
-			Volumes:     dindVolumes,
+			Volumes:     append(compose.Binds(dindVolumes...), volumeMasks...),
+			Tmpfs:       tmpfsMasks,
 			DNS:         []string{in.gatewayIP, "127.0.0.11"},
 			Networks: map[string]*compose.ServiceNetwork{
 				"sandbox": {},
@@ -292,16 +321,22 @@ func generateCompose(in composeInput) (string, error) {
 			in.dindVolume: {External: true},
 		}
 	}
+	if len(volumeMasks) > 0 {
+		if file.Volumes == nil {
+			file.Volumes = map[string]*compose.Volume{}
+		}
+		file.Volumes[in.maskVolume] = &compose.Volume{External: true}
+	}
 
 	data, err := compose.Marshal(file)
 	if err != nil {
-		return "", err
+		return "", maskPlan{}, err
 	}
 	path := filepath.Join(in.runTmpDir, "docker-compose.yml")
 	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return "", fmt.Errorf("write compose file: %w", err)
+		return "", maskPlan{}, fmt.Errorf("write compose file: %w", err)
 	}
-	return path, nil
+	return path, maskPlan{targets: mounts.maskTargets(), subpaths: mounts.maskSubpaths()}, nil
 }
 
 func (in composeInput) projectDir() string { return in.opts.ProjectDir }

@@ -195,9 +195,59 @@ Carried over verbatim from 1.x:
 
 ### `files.exclude`
 
-Each entry becomes an over-mount: files get `/dev/null:<path>:ro`, directories get an empty
-directory created under the run temp dir. Never anonymous volumes — `compose down` leaks those
-without `-v`, and the run dir is wiped in teardown anyway.
+Each entry becomes a mask on the container path: files get an over-mount of `/dev/null:<path>:ro`,
+directories get their own subdirectory of the sandbox's **mask volume**
+`hole-sandbox-masks-<instance>`, mounted over the path with the long-form volume syntax
+(`type: volume`, `volume.subpath: "<n>"`) on the agent and the DinD sidecar alike. Neither has a
+source on the host, and that is the point — a bind of an empty host directory (what 2.x did until
+the Docker VMM finding) is nested inside the project's own host bind, and Docker Desktop's libkrun
+VMM tears such a mount down about a second after the container starts, silently unhiding the
+directory. A volume's source lives inside the VM and survives; that was measured for subpath
+mounts on Docker VMM, Apple Virtualization and Colima (see
+[the analysis](../analysis/docker-desktop-vmm-exclusion-loss.md)).
+
+The volume is disk-backed, so a build writing gigabytes into an excluded `target` or
+`node_modules` lands on Docker's disk (on macOS, the VM's bounded disk image) and disappears with
+the sandbox — the semantics the host placeholder had. It is **one volume per sandbox**, not one per
+directory: the excluded directories across the project, every library and every pool worktree can
+number in the dozens, and each would otherwise cost an API call, a `docker volume ls` line and a GC
+iteration. Its lifecycle is the DinD volume's: created by `Start` after the networks and the
+instance registration (so GC cannot sweep a concurrent start), recorded as
+`state.Instance.MaskVolume`, removed by teardown, `hole destroy` and the GC volume pass. It is
+created only when at least one excluded path is a directory.
+
+`subpath` requires the subdirectory to exist, and a fresh volume is `root:root 755` while the agent
+runs unprivileged. So after `compose up gateway`, `prepareMaskVolume` runs two helpers over the
+gateway image ([architecture](architecture.md#the-gateway-image-is-also-the-helper-image)): one
+mounts the whole volume, `mkdir -p`s every subpath and `chown`s it to the agent's uid/gid; the
+second mounts one prepared subpath and runs `true` — the honest, runtime-agnostic check that the
+engine can mount subpaths at all (podman's compatibility API does not follow Docker's API
+numbering, so an API-version gate would misroute it).
+
+**The tmpfs fallback.** Subpath mounts need Docker Engine 26 / API 1.45 and Compose 2.26. Hole
+masks directories with a tmpfs instead — the service's `tmpfs` key, with `exec` because the
+runtime's default is `noexec` and an excluded `node_modules` or `target` holds binaries a build
+then runs — when either check fails:
+
+- `compose version --short` parses as a version below 2.26.0 (an unparsable version — a fork,
+  podman-compose — is trusted and left to the probe). This is decided before the compose file is
+  generated, and no volume is created.
+- The preparation or the probe fails. The compose file has already been written for the volume and
+  the gateway is already up, so the file is regenerated with tmpfs masks; the gateway's definition
+  is the same in both, so compose leaves it running. The volume is then removed.
+
+Either way a `logging.Warn` names the engine and its version and says that excluded directories
+are now RAM-backed and count against `container.memoryLimit`. It is warn-and-continue, not an
+error: an old engine is a user-environment limitation, the tmpfs is just as safe, and its only cost
+is memory — which the warning makes visible instead of letting a build be OOM-killed with no
+message tying it to the exclusion.
+
+Every mask is recorded in `mountBuilder.masks`, the single record every consumer derives from:
+`exclusionMounts()` for the sidecar mirror of file masks, `volumeMasks()` / `tmpfsMasks()` for the
+directory masks of both services, `maskSubpaths()` for the preparation run, and `maskTargets()` for
+the check against the container's own `/proc/self/mountinfo` once it is up; see
+[the mask check](#the-mask-check). Subpaths are numbered in recording order, so both generations of
+one start agree on them.
 
 Entries containing `*`, `?` or `[` are globs, expanded by a custom matcher because stdlib
 `filepath.Glob` has no `**`. It walks segment by segment, so a `**` pattern prunes instead of
@@ -225,6 +275,42 @@ exposure (see [analysis/security-audit.md](../analysis/security-audit.md), findi
 - **`files.exclude` has no reach into `files.include` targets.** Patterns are resolved against the
   project directory and, separately, against each library's own mount. An included path — `~/.claude`,
   `~/.m2/repository` — is mounted whole or not at all.
+
+### The mask check
+
+`generateCompose` returns every masked container path alongside the compose file, and `Start`
+asserts each one is a mount point inside the agent container — and inside the DinD sidecar, which
+carries the same masks — before attaching the terminal. A path that is not masked aborts the
+start, so the deferred teardown destroys the sandbox; it is the "makes the sandbox wrong or
+unsafe" branch of the error-handling rule, never a warning.
+
+The check runs once, as soon as `compose up` returns. The agent process is already running by
+then — compose starts it — so this is not a gate in front of the agent; it is the earliest point
+at which the container's mount table can be read at all, and the directory masks it checks —
+volume subpaths or tmpfs — have no host source for a runtime to drop later. A subpath mount is a
+mount point in `mountinfo` exactly like a tmpfs, so the check is the same for both.
+
+Four things make the check what it is:
+
+- **It runs inside the container.** `docker inspect` reports the mounts the runtime was *given*,
+  and keeps reporting them after the kernel has dropped one, so a host-side check cannot see the
+  failure it exists to catch. `Engine.Exec` reads `/proc/self/mountinfo` instead.
+- **It compares whole paths.** `/project/secrets` being mounted says nothing about
+  `/project/secrets2`, and the kernel's octal escapes (`\040` for a space) are decoded first, or a
+  project path with a space in it would make every exclusion under it look dropped.
+- **It follows symlinks the way the runtime did.** A mount destination is resolved inside the
+  rootfs before mounting, so an excluded `linked-secrets -> secrets` is listed in the mount table
+  under `secrets`. Each target is first resolved with `readlink -f` inside the container, looked
+  up under that path, and reported under the name the settings used.
+- **An exited container is skipped, not refused.** A non-interactive run whose agent has already
+  finished has nothing left to protect, and failing it would fail a run that did its work. The
+  state is read only after an exec fails, never before: a container can exit between the two
+  calls, and a pre-check would turn that into a refusal of a run that did its work.
+
+The one runtime known to need this is Docker Desktop's Docker VMM (libkrun); on macOS the error
+says so and points at the Apple Virtualization framework. That hint is a message and nothing more —
+the check runs on every host and every runtime, because the next quirk of this shape will not
+announce itself either.
 
 ### `files.include`, `libraries`, `git.worktreeLinks`, `git.worktreePool`, `--library`
 
@@ -336,7 +422,7 @@ documented "write your secret patterns once, globally" advice hold for a checkou
 settings file; an entry named by both sources resolves to one container target, which the builder's
 `seen` map already keeps exactly once. Inside the pool it is load-bearing: the pool is a *single* mount at its
 root, so without it `<pool>/feature/.env` would be visible while the same checkout mounted as its own
-library is protected. The children get over-mounts, not mounts of their own — source and target are
+library is protected. The children get masks, not mounts of their own — source and target are
 the same absolute path, so they land inside the pool mount exactly like the project's own exclusions.
 The child list comes from `git worktree list`, so unrelated directories a user parked in the pool are
 left alone. The project's own `files.exclude` deliberately does not reach into them, for the same
@@ -427,7 +513,8 @@ over-mounts below — both verified escapes (see
 [analysis/security-audit.md](../analysis/security-audit.md), findings 1 and 3). Under
 `docker:dind-rootless` the daemon runs as an unprivileged user in a user namespace, so a nested
 container maps to a subuid that owns none of the host's device nodes: the same raw-disk read and
-the same over-mount `umount` both fail. The outer container stays privileged because rootlesskit
+the same `umount` of a mask both fail — a directory mask is inherited into the nested user
+namespace `MNT_LOCKED` exactly as an over-mount is. The outer container stays privileged because rootlesskit
 needs it (unprivileged, or `SYS_ADMIN`+`NET_ADMIN` without `--privileged`, the daemon starts but
 cannot run a single container — it fails at the session-keyring and `/proc` mount steps), so this
 is defense-in-depth: a kernel or runtime escape from the privileged sidecar can still reach the
@@ -437,7 +524,9 @@ them wrong fails silently (a healthy-looking daemon that cannot run containers, 
 no route to the gateway), which is why they are called out here.
 
 The sidecar receives the project mount, then `mountBuilder.libraries`, then
-`mountBuilder.dockerIncludes`, then `mountBuilder.exclusions`. Libraries have to be there: the
+`mountBuilder.dockerIncludes`, then `mountBuilder.exclusionMounts()`, then the directory masks —
+`mountBuilder.volumeMasks()` at the end of the list, or `mountBuilder.tmpfsMasks()` in its own
+`tmpfs` key on the fallback. Libraries have to be there: the
 daemon resolves `-v` paths in its own filesystem, and an unmirrored one is not an error but a
 silently empty directory in the nested container. Exclusions have to be there so that path cannot become a
 way to read what the agent was meant not to see. `files.include` reaches it **only per entry**,
@@ -456,6 +545,14 @@ and unhide the excluded file. Flagged includes sit between the two for the same 
 come last: nothing that hides a path may be buried under a bind added afterwards. Moby does sort
 mounts by destination depth, but that is the engine's implementation detail, not something to lean
 on.
+
+Volume masks follow that rule — they are appended last, on the agent as on the sidecar. The tmpfs
+fallback is the one exception, and it has no choice: it lives in a separate compose key, so its
+position among the volumes cannot be expressed at all and the runtime's destination-ordered
+handling is exactly what it leans on. Both are pinned by `make itest`:
+`TestVolumeMaskHidesContentOfTheMountItSitsIn` and `TestTmpfsMaskHidesContentOfTheMountItSitsIn`
+assert against a real runtime that a mask nested in another mount hides its content instead of
+being shadowed by it.
 
 A mirrored `:ro` library keeps its read-only-ness for the same reason a mirrored over-mount cannot
 be unmounted: the daemon is rootless, so mounts it inherits into its user namespace are
