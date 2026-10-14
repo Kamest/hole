@@ -109,7 +109,7 @@ hole uninstall                 # remove Hole's Docker resources and the binary
 hole help                      # usage
 ```
 
-`hole list` shows the instance ID, agent (and profile), project path, uptime, whether Docker-in-Docker is enabled, the sandbox network, and which settings files were merged.
+`hole list` shows the instance ID, agent (and profile), project path, uptime, whether Docker-in-Docker is enabled, the sandbox network, and which settings files were merged — the global one by path, e.g. `global(~/.hole/settings.json)+project`, so a sandbox started with [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file) shows which file it runs with.
 
 ## Installation
 
@@ -202,7 +202,8 @@ hole uninstall
 ```
 
 Removes Hole's containers, networks, volumes and images, then the binary. Your settings, custom
-agents and logs in `~/.hole` are only removed if you confirm. If no container runtime is available,
+agents and logs in `~/.hole` are only removed if you confirm. A file named by
+[`HOLE_SETTINGS_FILE`](#alternative-global-settings-file) is not Hole's and is never removed. If no container runtime is available,
 the uninstall says so, names what it could not remove, and still takes the binary — a stopped daemon
 must not leave you with Hole installed.
 
@@ -364,7 +365,7 @@ Names must match `^[a-z0-9][a-z0-9-]*$`, and a name that collides with a builtin
 
 Two optional files, sharing one schema:
 
-- `~/.hole/settings.json` — global defaults
+- `~/.hole/settings.json` — global defaults (or the file named by [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file))
 - `<project>/.hole/settings.json` — per-project settings
 
 They are merged: objects deep-merge with the project winning, arrays concatenate (global first) and deduplicate, and scalars are overridden by the project.
@@ -378,6 +379,20 @@ Add the schema reference for editor completion:
 ```
 
 All path-valued settings support `$VAR`/`${VAR}` expansion, `~/` (your home on the host side, the sandbox home on the container side), and paths relative to the project directory.
+
+### Alternative global settings file
+
+A tool that wraps Hole can hand it a different global settings document without touching `HOME`:
+
+```sh
+HOLE_SETTINGS_FILE=/path/to/generated-settings.json hole start claude .
+```
+
+- The file **replaces** `~/.hole/settings.json` for that run — the two are not merged. The project's `.hole/settings.json` is merged on top as usual.
+- Only the settings document moves. `~` keeps meaning your real home, so `~/…` paths in project settings still resolve where they always did, and custom agents, [project trust](#project-trust), logs and the running-sandbox registry stay in `~/.hole`.
+- It must be an absolute path to an existing file; anything else stops the start instead of silently falling back to the default settings.
+- It must not lie inside the project or inside any included, library or worktree path: the global file is trusted without a prompt, so an agent that could edit it could add a `hooks.setupHost` that runs on your host at the next start. Hole refuses to start in that case (symlinks are followed).
+- Relative paths inside it (hook scripts, for example) resolve against the **project**, like in any settings file — a wrapper shipping scripts beside the file should reference them by absolute path.
 
 ### Project trust
 

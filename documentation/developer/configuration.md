@@ -6,6 +6,17 @@ binary):
 - `~/.hole/settings.json` — global defaults
 - `<project>/.hole/settings.json` — per-project settings
 
+The global document's path comes from `hostenv.Host.GlobalSettingsFile()`: `HOLE_SETTINGS_FILE`
+(read once in `DetectHost`) replaces it when set, for wrappers that generate their own global
+settings ([issue #46](https://github.com/lukashornych/hole/issues/46),
+[analysis](../analysis/config-dir-override.md)). Nothing else follows it: `Host.Home`, `HoleDir()`
+and therefore agents, trust, the instance registry, `tmp/`, logs, GC and the image identity are
+unchanged — moving those would split the runtime registry that GC and `isLastInstance` rely on.
+`Start` validates the override first (`ValidateSettingsFile`: absolute, existing regular file); a
+missing override is fatal rather than a silent fall-back to defaults. The path the run actually read
+is recorded in `Instance.SettingsFiles`, which `hole list` labels from (`global(<path>)`), not from
+the listing process's own environment.
+
 User-facing reference and examples live in the [README](../../README.md#configuration); this page
 documents the mechanics.
 
@@ -94,6 +105,13 @@ Three details carry the design:
   start, never from the file. An unreadable record counts as untrusted — the failure direction has
   to be a prompt. `~/.hole` is not part of any sandbox mount
   unless the user mounts it explicitly, which is itself a gated `files.include`.
+- **`HOLE_SETTINGS_FILE` is trusted like the default global file**, so it must not be writable from
+  inside the sandbox. `checkSettingsFileNotExposed` (`internal/sandbox/mounts.go`) refuses a start
+  when the symlink-resolved file lies under the project, a `files.include` source, a library
+  (configured, `--library`, git-derived) or the worktree pool. It runs right after the trust gate,
+  before any host hook. The default `~/.hole/settings.json` is not checked — mounting `~/.hole` is
+  already a gated choice. Scripts the global file references are out of scope, as they are for the
+  default file.
 
 Without a terminal the start fails, naming the file, the keys and `--trust-project`; that flag
 accepts the current grant set non-interactively and records it. Failing to *write* the record is a

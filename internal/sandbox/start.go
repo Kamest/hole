@@ -71,6 +71,9 @@ func Start(opts Options) (exitCode int, err error) {
 	}()
 
 	host := hostenv.DetectHost()
+	if err := host.ValidateSettingsFile(); err != nil {
+		return 1, err
+	}
 	projectName := hostenv.ProjectName(opts.ProjectDir)
 	instanceID, err := hostenv.InstanceID()
 	if err != nil {
@@ -158,6 +161,11 @@ func Start(opts Options) (exitCode int, err error) {
 		In:           os.Stdin,
 		Out:          os.Stderr,
 	}); err != nil {
+		return 1, err
+	}
+
+	gitLayout := worktree.Derive(opts.ProjectDir, worktreeMode(settings), settings.Git.WorktreePool)
+	if err := checkSettingsFileNotExposed(host, opts.ProjectDir, settings, gitLayout, opts.Libraries); err != nil {
 		return 1, err
 	}
 
@@ -292,7 +300,6 @@ func Start(opts Options) (exitCode int, err error) {
 		return 1, err
 	}
 
-	gitLayout := worktree.Derive(opts.ProjectDir, worktreeMode(settings), settings.Git.WorktreePool)
 	if err := ensureWorktreePool(gitLayout.Pool); err != nil {
 		return 1, err
 	}
@@ -530,7 +537,7 @@ func loadSettingsDocument(host hostenv.Host, projectDir, profile string) (settin
 	globalPath := host.GlobalSettingsFile()
 	projectPath := projectSettingsFile(projectDir)
 
-	globalDoc, err := config.LoadAndValidate(globalPath, "global settings (~/.hole/settings.json)")
+	globalDoc, err := config.LoadAndValidate(globalPath, fmt.Sprintf("global settings (%s)", globalPath))
 	if err != nil {
 		return settingsDocuments{}, err
 	}

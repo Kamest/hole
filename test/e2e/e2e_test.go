@@ -110,9 +110,16 @@ func write(t *testing.T, path, content string) {
 // the plugin sits in a system directory.
 //
 // An explicit DOCKER_CONFIG is honored, so a developer can point the suite at a different client
-// configuration.
+// configuration. An exported HOLE_SETTINGS_FILE is not: it would replace every test's global
+// settings with the developer's.
 func holeEnv(home string) []string {
-	env := append(os.Environ(), "HOME="+home)
+	var env []string
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "HOLE_SETTINGS_FILE=") {
+			env = append(env, entry)
+		}
+	}
+	env = append(env, "HOME="+home)
 	if os.Getenv("DOCKER_CONFIG") == "" {
 		if realHome, err := os.UserHomeDir(); err == nil {
 			env = append(env, "DOCKER_CONFIG="+filepath.Join(realHome, ".docker"))
@@ -388,6 +395,32 @@ func TestGlobalExclusionsHideLibraryFiles(t *testing.T) {
 	}
 	if content, err := os.ReadFile(filepath.Join(libraryDir, ".env")); err != nil || !strings.Contains(string(content), "SECRET") {
 		t.Error("the excluded host file was modified")
+	}
+	assertNoLeftovers(t, projectDir)
+}
+
+// HOLE_SETTINGS_FILE replaces only the global settings document: `~` in the project settings keeps
+// meaning the real home, which the old `HOME=<dir>` workaround broke (issue #46).
+func TestSettingsFileOverrideKeepsProjectTildeIncludes(t *testing.T) {
+	settings := `{"container":{"enabledAgents":["test-agent"]},"files":{"include":{"~/included.txt":{"path":"/tmp/included.txt"}}}}`
+	command := `["bash", "-c", "sleep 3; cat /tmp/included.txt; echo \"FROM=$HOLE_E2E_SETTINGS\""]`
+	home, projectDir := environment(t, command, settings)
+	write(t, filepath.Join(home, "included.txt"), "HOLE_E2E_INCLUDED\n")
+	write(t, filepath.Join(home, ".hole", "settings.json"), `{"environment":{"HOLE_E2E_SETTINGS":"default"}}`)
+	override := filepath.Join(t.TempDir(), "wrapper-settings.json")
+	write(t, override, `{"environment":{"HOLE_E2E_SETTINGS":"override"}}`)
+
+	cmd := exec.Command(holeBinary, "start", "test-agent", projectDir, "--trust-project")
+	cmd.Env = append(holeEnv(home), "HOLE_SETTINGS_FILE="+override)
+	output, err := runWithTimeout(cmd, 20*time.Minute)
+	if err != nil {
+		t.Fatalf("hole start failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(output, "HOLE_E2E_INCLUDED") {
+		t.Errorf("the project's ~/ include was not mounted from the real home:\n%s", output)
+	}
+	if !strings.Contains(output, "FROM=override") {
+		t.Errorf("the global settings did not come from HOLE_SETTINGS_FILE:\n%s", output)
 	}
 	assertNoLeftovers(t, projectDir)
 }

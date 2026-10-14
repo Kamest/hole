@@ -412,3 +412,50 @@ func (b *mountBuilder) addPoolWorktreeExclusions(worktrees []string) error {
 	}
 	return nil
 }
+
+// checkSettingsFileNotExposed refuses a HOLE_SETTINGS_FILE that lies inside the project or any
+// path the settings would mount: includes, libraries, git-derived worktrees and the pool. The
+// global document is trusted without a prompt, so an agent that can write it could add a
+// `hooks.setupHost` the next start runs on the host. It runs before the trust gate and every host
+// hook, so a tampered file is refused before anything in it executes.
+//
+// The default ~/.hole/settings.json is not checked: mounting ~/.hole is already a choice the trust
+// gate sees.
+func checkSettingsFileNotExposed(host hostenv.Host, projectDir string, settings *config.Settings, gitLayout worktree.Derivation, libraryFlags []string) error {
+	if host.SettingsFile == "" {
+		return nil
+	}
+	libraries, err := mergeLibraries(host, projectDir, settings.Libraries, gitLayout.Links, libraryFlags)
+	if err != nil {
+		return err
+	}
+	sources := []string{projectDir}
+	for _, rawHostPath := range config.SortedKeys(settings.Files.Include) {
+		sources = append(sources, host.ResolveHostPath(rawHostPath, projectDir))
+	}
+	sources = append(sources, config.SortedKeys(libraries)...)
+	if gitLayout.Pool != "" {
+		sources = append(sources, gitLayout.Pool)
+	}
+
+	settingsFile := resolveSymlinks(host.SettingsFile)
+	for _, source := range sources {
+		resolvedSource := resolveSymlinks(source)
+		if settingsFile == resolvedSource || strings.HasPrefix(settingsFile, resolvedSource+string(filepath.Separator)) {
+			return fmt.Errorf(
+				"HOLE_SETTINGS_FILE '%s' lies inside '%s', which is mounted into the sandbox; "+
+					"the agent could rewrite the global settings, so move the file outside every mounted path",
+				host.SettingsFile, source)
+		}
+	}
+	return nil
+}
+
+// resolveSymlinks returns the symlink-free form of path, or path itself when it cannot be resolved.
+func resolveSymlinks(path string) string {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return path
+	}
+	return resolved
+}

@@ -54,8 +54,9 @@ Options:
 
 Configure file exclusions, inclusions, libraries, allowed domains, dependencies,
 environment variables, container settings, agent arguments and hooks via
-.hole/settings.json (per-project) or ~/.hole/settings.json (global). Named overlays go
-under the "profiles" key and are selected with {agent}:{profile}.
+.hole/settings.json (per-project) or ~/.hole/settings.json (global, or the file named by
+$HOLE_SETTINGS_FILE). Named overlays go under the "profiles" key and are selected with
+{agent}:{profile}.
 
 Examples:
   hole start claude .
