@@ -40,7 +40,9 @@ type mountBuilder struct {
 	// volume's subpaths and the targets verifyMasks checks are all derived from it, so none of
 	// them can drift from the others.
 	masks []mask
-	seen  map[string]bool
+	// directoryMasks counts the directory masks recorded so far; it is the next one's subpath.
+	directoryMasks int
+	seen           map[string]bool
 	// globalExclude is the global `files.exclude` (with the selected profile chain applied). It
 	// is applied to every checkout that is not the project; the project mount gets its patterns
 	// from the merged settings, which already contain the global ones.
@@ -62,6 +64,9 @@ type mask struct {
 	mount   string
 	subpath string
 }
+
+// isDir reports whether the mask hides a directory, which carries no mount string of its own.
+func (m mask) isDir() bool { return m.mount == "" }
 
 // tmpfsMaskOptions are the mount options of every tmpfs mask. The runtime's default for a tmpfs
 // is `noexec,nosuid,nodev`, and an excluded directory like `node_modules` or `target` is where a
@@ -108,14 +113,15 @@ func (b *mountBuilder) addDirectoryMask(target string) {
 		return
 	}
 	b.seen[target] = true
-	b.masks = append(b.masks, mask{target: target, subpath: strconv.Itoa(len(b.maskSubpaths()))})
+	b.masks = append(b.masks, mask{target: target, subpath: strconv.Itoa(b.directoryMasks)})
+	b.directoryMasks++
 }
 
 // exclusionMounts are the over-mounts that hide files, mirrored in full onto the DinD sidecar.
 func (b *mountBuilder) exclusionMounts() []string {
 	var mounts []string
 	for _, mask := range b.masks {
-		if mask.mount != "" {
+		if !mask.isDir() {
 			mounts = append(mounts, mask.mount)
 		}
 	}
@@ -127,7 +133,7 @@ func (b *mountBuilder) exclusionMounts() []string {
 func (b *mountBuilder) maskSubpaths() []string {
 	var subpaths []string
 	for _, mask := range b.masks {
-		if mask.mount == "" {
+		if mask.isDir() {
 			subpaths = append(subpaths, mask.subpath)
 		}
 	}
@@ -139,7 +145,7 @@ func (b *mountBuilder) maskSubpaths() []string {
 func (b *mountBuilder) volumeMasks(volume string) []compose.ServiceVolume {
 	var entries []compose.ServiceVolume
 	for _, mask := range b.masks {
-		if mask.mount == "" {
+		if mask.isDir() {
 			entries = append(entries, compose.ServiceVolume{Source: volume, Target: mask.target, Subpath: mask.subpath})
 		}
 	}
@@ -152,7 +158,7 @@ func (b *mountBuilder) volumeMasks(volume string) []compose.ServiceVolume {
 func (b *mountBuilder) tmpfsMasks() []string {
 	var entries []string
 	for _, mask := range b.masks {
-		if mask.mount == "" {
+		if mask.isDir() {
 			entries = append(entries, mask.target+":"+tmpfsMaskOptions)
 		}
 	}

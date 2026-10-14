@@ -52,9 +52,12 @@ func verifyMasks(containerEngine *engine.Engine, container string, targets []str
 }
 
 // resolveMaskScript prints, for each argument, the path it resolves to in the container — or
-// the argument itself where that cannot be determined, so the caller always gets one line per
-// target.
-const resolveMaskScript = `for target; do readlink -f -- "$target" || printf '%s\n' "$target"; done`
+// the argument itself where that cannot be determined — NUL-terminated, so the caller always gets
+// one entry per target even when a path contains a newline. The `.` sentinel keeps the command
+// substitution from stripping newlines that end the path itself.
+const resolveMaskScript = `for target; do ` +
+	`resolved=$(readlink -f -- "$target" && echo .) && resolved=${resolved%??} || resolved=$target; ` +
+	`printf '%s\0' "$resolved"; done`
 
 // resolveMaskPaths asks the container where each target's mask has landed. The runtime
 // resolves a mount destination inside the rootfs before mounting, so a target that is a symlink
@@ -66,11 +69,11 @@ func resolveMaskPaths(containerEngine *engine.Engine, container string, targets 
 	if exited || err != nil {
 		return nil, exited, err
 	}
-	lines := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
-	if len(lines) != len(targets) {
-		return nil, false, fmt.Errorf("expected %d resolved paths, got %d", len(targets), len(lines))
+	resolved := strings.Split(strings.TrimSuffix(output, "\x00"), "\x00")
+	if len(resolved) != len(targets) {
+		return nil, false, fmt.Errorf("expected %d resolved paths, got %d", len(targets), len(resolved))
 	}
-	return lines, false, nil
+	return resolved, false, nil
 }
 
 // execUnlessExited runs one command of the check and tells a container that has exited apart

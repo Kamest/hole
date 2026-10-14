@@ -297,12 +297,9 @@ func Start(opts Options) (exitCode int, err error) {
 		return 1, err
 	}
 
-	// Decided before the file is generated; the probe after the gateway can still revoke it.
-	maskVolume := ""
-	subpathFallbackReason := subpathUnsupportedReason(containerEngine)
-	if subpathFallbackReason == "" {
-		maskVolume = maskVolumePrefix + instanceName
-	}
+	// Offered to the generator, which asks the engine only when there is a directory to mask; the
+	// probe after the gateway can still revoke it.
+	maskVolume := maskVolumePrefix + instanceName
 
 	in := composeInput{
 		instanceName:   instanceName,
@@ -326,6 +323,9 @@ func Start(opts Options) (exitCode int, err error) {
 		dockerEnabled:  dockerEnabled,
 		dindVolume:     instance.DinDVolume,
 		maskVolume:     maskVolume,
+		subpathUnsupported: func() string {
+			return subpathUnsupportedReason(containerEngine)
+		},
 		registryMirror: instance.RegistryMirror,
 		gitLayout:      gitLayout,
 		interactive:    engine.IsTerminal(os.Stdin),
@@ -338,8 +338,8 @@ func Start(opts Options) (exitCode int, err error) {
 	switch {
 	case len(masks.subpaths) == 0:
 		// No directory is excluded, so neither the volume nor the warning is needed.
-	case maskVolume == "":
-		warnTmpfsFallback(containerEngine, subpathFallbackReason)
+	case masks.fallbackReason != "":
+		warnTmpfsFallback(containerEngine, masks.fallbackReason)
 	default:
 		// Created after the networks and once the instance is registered, like the DinD volume,
 		// so GC cannot mistake it for an orphan of a dead sandbox.
@@ -367,9 +367,8 @@ func Start(opts Options) (exitCode int, err error) {
 	// After the gateway, whose image the helpers run over, and before any service mounts a subpath.
 	if instance.MaskVolume != "" {
 		if err := prepareMaskVolume(containerEngine, gatewayImage, instanceName, instance.MaskVolume,
-			masks.subpaths, host.BuildUID()+":"+host.BuildGID()); err != nil {
-			logging.Debug("%v", err)
-			warnTmpfsFallback(containerEngine, "preparing or mounting a subpath of the mask volume failed")
+			masks.subpaths, host.BuildUID()+":"+host.BuildGID(), filepath.Join(host.HoleDir(), subpathProbeFile)); err != nil {
+			warnTmpfsFallback(containerEngine, err.Error())
 			// The gateway's own definition is the same in both files, so compose leaves it running.
 			in.maskVolume = ""
 			if composeFile, masks, err = generateCompose(in); err != nil {

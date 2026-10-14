@@ -278,6 +278,20 @@ func (e *Engine) ServerVersion() string {
 	return strings.TrimSpace(out)
 }
 
+// ClientServerVersion is the CLI's and the engine's version, space-separated, or "" when either
+// cannot be read.
+func (e *Engine) ClientServerVersion() string {
+	out, err := e.output("version", "--format", "{{.Client.Version}} {{.Server.Version}}")
+	if err != nil {
+		return ""
+	}
+	versions := strings.Fields(out)
+	if len(versions) != 2 {
+		return ""
+	}
+	return strings.Join(versions, " ")
+}
+
 // NetworkRemove removes a network.
 func (e *Engine) NetworkRemove(name string) error {
 	return e.RunQuiet("network", "rm", name)

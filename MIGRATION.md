@@ -244,7 +244,8 @@ refusing to start the sandbox if one is not. Consequences worth knowing: what th
 into an excluded directory now lands in that volume on Docker's disk and disappears with the
 sandbox, instead of landing in Hole's run directory on your disk; a start can now fail with a
 message naming an exposed path where it previously succeeded silently; and on an engine older than
-Docker Engine 26 / Compose 2.26, which cannot mount part of a volume, excluded directories fall
+Docker Engine 26 / Compose 2.26, which cannot mount part of a volume (and on podman with
+podman-compose), excluded directories fall
 back to an in-memory tmpfs with a warning on every start — what is written into them then counts
 against `container.memoryLimit`, so update the engine or size the limit for a build that writes a
 lot into an excluded `target` or `node_modules`. The check runs once, right after the container is created; the

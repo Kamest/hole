@@ -346,6 +346,35 @@ func TestGenerateComposeExcludesDirectoriesWithMaskVolumeSubpaths(t *testing.T) 
 	}
 }
 
+// An engine that cannot mount volume subpaths gets tmpfs masks even when a mask volume is
+// offered, and the plan carries the reason so Start can warn and skip creating the volume.
+func TestGenerateComposeFallsBackToTmpfsWhenSubpathsAreUnsupported(t *testing.T) {
+	projectDir, _ := fixture(t)
+	settings := &config.Settings{}
+	settings.Files.Exclude = []string{"secrets"}
+
+	in := testInput(t, projectDir, t.TempDir(), settings, Options{})
+	in.maskVolume = "hole-sandbox-masks-x"
+	in.subpathUnsupported = func() string { return "compose 2.20.0 is older than 2.26" }
+	path, masks, err := generateCompose(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "hole-sandbox-masks-x") {
+		t.Errorf("the mask volume is referenced although subpaths are unsupported:\n%s", data)
+	}
+	if !strings.Contains(string(data), projectDir+"/secrets:exec") {
+		t.Errorf("the excluded directory is not masked by a tmpfs:\n%s", data)
+	}
+	if masks.fallbackReason != "compose 2.20.0 is older than 2.26" {
+		t.Errorf("fallback reason = %q, want the engine's", masks.fallbackReason)
+	}
+}
+
 // A sandbox with no excluded directory needs no mask volume, so the file must not reference one:
 // Start only creates the volume when there is a subpath to mount.
 func TestGenerateComposeDeclaresNoMaskVolumeWithoutExcludedDirectories(t *testing.T) {
@@ -355,6 +384,10 @@ func TestGenerateComposeDeclaresNoMaskVolumeWithoutExcludedDirectories(t *testin
 
 	in := testInput(t, projectDir, t.TempDir(), settings, Options{})
 	in.maskVolume = "hole-sandbox-masks-x"
+	in.subpathUnsupported = func() string {
+		t.Error("the engine was asked about volume subpaths with no directory to mask")
+		return ""
+	}
 	path, masks, err := generateCompose(in)
 	if err != nil {
 		t.Fatal(err)

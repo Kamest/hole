@@ -224,19 +224,35 @@ second mounts one prepared subpath and runs `true` — the honest, runtime-agnos
 engine can mount subpaths at all (podman's compatibility API does not follow Docker's API
 numbering, so an API-version gate would misroute it).
 
+The probe's answer only changes with the engine, so a success is cached in
+`~/.hole/subpath-probe.json`, keyed by the runtime binary plus its CLI and engine versions
+(`engine.ClientServerVersion`, one `version` call instead of a container run). A start whose key
+matches skips the probe; any version change — a Docker update — misses the key, probes again and
+overwrites the record, so nothing ever has to invalidate it. Only successes are recorded: a failed
+probe may be transient, and caching it would pin the sandbox to tmpfs. An engine whose versions
+cannot be read is always probed. The key cannot see a change that keeps every version, such as
+switching Docker Desktop's VM backend; a stale "supported" then surfaces as a failed `compose up`,
+never as an exposed path, and `verifyMasks` checks every mask regardless. Deleting the file forces
+a fresh probe.
+
 **The tmpfs fallback.** Subpath mounts need Docker Engine 26 / API 1.45 and Compose 2.26. Hole
 masks directories with a tmpfs instead — the service's `tmpfs` key, with `exec` because the
 runtime's default is `noexec` and an excluded `node_modules` or `target` holds binaries a build
 then runs — when either check fails:
 
-- `compose version --short` parses as a version below 2.26.0 (an unparsable version — a fork,
-  podman-compose — is trusted and left to the probe). This is decided before the compose file is
-  generated, and no volume is created.
+- `compose version --short` parses as a version below 2.26.0 (an unparsable version is trusted and
+  left to the probe). podman-compose reports its own 1.x numbering and so always falls back: the
+  probe runs `podman run`, which cannot vouch for how podman-compose writes a subpath mount, and
+  that has not been verified. The check is made while the compose file is generated, and only when
+  there is a directory to mask (`composeInput.subpathUnsupported`), so a sandbox without one never
+  runs `compose version`. No volume is created.
 - The preparation or the probe fails. The compose file has already been written for the volume and
   the gateway is already up, so the file is regenerated with tmpfs masks; the gateway's definition
   is the same in both, so compose leaves it running. The volume is then removed.
 
-Either way a `logging.Warn` names the engine and its version and says that excluded directories
+Either way a `logging.Warn` names the engine and its version, gives the reason — for a failed
+probe the engine's own error, e.g. a docker CLI older than 26 that does not know `volume-subpath`
+— and says that excluded directories
 are now RAM-backed and count against `container.memoryLimit`. It is warn-and-continue, not an
 error: an old engine is a user-environment limitation, the tmpfs is just as safe, and its only cost
 is memory — which the warning makes visible instead of letting a build be OOM-killed with no

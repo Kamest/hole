@@ -63,6 +63,7 @@ directory to keep in sync. See [guidelines](guidelines.md#non-negotiable-rules).
 | `~/.hole/tmp/run.XXXXXX/` | per-run generated artifacts |
 | `~/.hole/state.json` | the last version that completed a run |
 | `~/.hole/trust.json` | project paths whose settings the user accepted, and what they accepted |
+| `~/.hole/subpath-probe.json` | the engine version the volume-subpath probe last passed on ([configuration](configuration.md#filesexclude)) |
 
 The run temp directory lives under `$HOME` rather than `$TMPDIR` because Colima, Lima and
 Podman-Machine VMs share `$HOME` but not `/var/folders`, and generated files there must be

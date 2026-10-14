@@ -70,8 +70,12 @@ type composeInput struct {
 	// maskVolume is the sandbox's mask volume, whose subdirectories hide excluded directories.
 	// Empty means the engine cannot mount volume subpaths, and directories are masked with a
 	// tmpfs instead.
-	maskVolume     string
-	registryMirror string
+	maskVolume string
+	// subpathUnsupported returns why the engine cannot mount volume subpaths, or "" when it can.
+	// It is asked only when maskVolume is set and there is a directory to mask, so a sandbox
+	// without one never pays for the engine query. Nil means supported.
+	subpathUnsupported func() string
+	registryMirror     string
 	// gitLayout is what the project's git worktree layout implies: the libraries to mount and,
 	// in pool mode, the pool directory (already created on the host by then).
 	gitLayout worktree.Derivation
@@ -86,10 +90,12 @@ type composeInput struct {
 // every exclusion hides, which verifyMasks asserts once the sandbox is up, and the subdirectories
 // of the mask volume the directory masks mount, which must exist before any service starts. The
 // subpaths are listed whether or not the file uses the volume, so a caller can tell whether there
-// are directory masks at all.
+// are directory masks at all. fallbackReason is set when a mask volume was offered but the engine
+// cannot mount its subpaths, so the directories are masked with a tmpfs instead.
 type maskPlan struct {
-	targets  []string
-	subpaths []string
+	targets        []string
+	subpaths       []string
+	fallbackReason string
 }
 
 // generateCompose writes the single compose file for this run and returns its path together
@@ -130,8 +136,15 @@ func generateCompose(in composeInput) (string, maskPlan, error) {
 	// two forms is non-empty.
 	var volumeMasks []compose.ServiceVolume
 	var tmpfsMasks []string
-	if in.maskVolume != "" {
-		volumeMasks = mounts.volumeMasks(in.maskVolume)
+	maskVolume := in.maskVolume
+	fallbackReason := ""
+	if maskVolume != "" && mounts.directoryMasks > 0 && in.subpathUnsupported != nil {
+		if fallbackReason = in.subpathUnsupported(); fallbackReason != "" {
+			maskVolume = ""
+		}
+	}
+	if maskVolume != "" {
+		volumeMasks = mounts.volumeMasks(maskVolume)
 	} else {
 		tmpfsMasks = mounts.tmpfsMasks()
 	}
@@ -325,7 +338,7 @@ func generateCompose(in composeInput) (string, maskPlan, error) {
 		if file.Volumes == nil {
 			file.Volumes = map[string]*compose.Volume{}
 		}
-		file.Volumes[in.maskVolume] = &compose.Volume{External: true}
+		file.Volumes[maskVolume] = &compose.Volume{External: true}
 	}
 
 	data, err := compose.Marshal(file)
@@ -336,7 +349,7 @@ func generateCompose(in composeInput) (string, maskPlan, error) {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return "", maskPlan{}, fmt.Errorf("write compose file: %w", err)
 	}
-	return path, maskPlan{targets: mounts.maskTargets(), subpaths: mounts.maskSubpaths()}, nil
+	return path, maskPlan{targets: mounts.maskTargets(), subpaths: mounts.maskSubpaths(), fallbackReason: fallbackReason}, nil
 }
 
 func (in composeInput) projectDir() string { return in.opts.ProjectDir }

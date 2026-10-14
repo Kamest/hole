@@ -8,6 +8,7 @@
 package sandbox
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -78,8 +79,13 @@ func createPreparedMaskVolume(t *testing.T, containerEngine *engine.Engine, volu
 		t.Fatalf("create mask volume: %v", err)
 	}
 	t.Cleanup(func() { _ = containerEngine.VolumeRemove(volume) })
-	if err := prepareMaskVolume(containerEngine, maskTestImage, "hole-itest-"+volume, volume, subpaths, owner); err != nil {
+	probeCache := filepath.Join(t.TempDir(), subpathProbeFile)
+	if err := prepareMaskVolume(containerEngine, maskTestImage, "hole-itest-"+volume, volume, subpaths, owner, probeCache); err != nil {
 		t.Fatalf("prepareMaskVolume: %v", err)
+	}
+	identity := containerEngine.Binary + " " + containerEngine.ClientServerVersion()
+	if !subpathProbeCached(probeCache, identity) {
+		t.Errorf("a successful probe was not recorded for %q", identity)
 	}
 }
 
@@ -255,6 +261,22 @@ func TestVerifyMasksAcceptsAndRefusesARealContainer(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "/masked,") {
 		t.Errorf("error %q also blames the path that is masked", err)
+	}
+}
+
+// A path is free to contain a newline, so the resolved paths cannot be read back one per line.
+func TestVerifyMasksAcceptsATargetWithANewline(t *testing.T) {
+	containerEngine := testEngine(t)
+	if err := containerEngine.RunQuiet("pull", maskTestImage); err != nil {
+		t.Skipf("cannot pull %s: %v", maskTestImage, err)
+	}
+
+	target := "/masked\nsecrets"
+	container := "hole-itest-mask-newline"
+	runMaskContainer(t, containerEngine, container, "--tmpfs", target, "--tmpfs", "/plain")
+
+	if err := verifyMasks(containerEngine, container, []string{target, "/plain"}); err != nil {
+		t.Errorf("verifyMasks rejected a masked target that contains a newline: %v", err)
 	}
 }
 
