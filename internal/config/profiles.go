@@ -203,8 +203,8 @@ func (e *UnknownProfileError) Error() string {
 	} else {
 		_, _ = fmt.Fprintf(&sb, "unknown profile '%s'", e.Name)
 	}
-	_, _ = fmt.Fprintf(&sb, "\n  profiles in ~/.hole/settings.json: %s", formatNames(e.Global))
-	_, _ = fmt.Fprintf(&sb, "\n  profiles in .hole/settings.json:   %s", formatNames(e.Project))
+	_, _ = fmt.Fprintf(&sb, "\n  profiles in global settings:     %s", formatNames(e.Global))
+	_, _ = fmt.Fprintf(&sb, "\n  profiles in .hole/settings.json: %s", formatNames(e.Project))
 	return sb.String()
 }
 

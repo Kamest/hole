@@ -73,13 +73,17 @@ type Host struct {
 	// themselves, and forcing the host IDs there breaks the container user.
 	UID string
 	GID string
+	// SettingsFile overrides the global settings document (HOLE_SETTINGS_FILE). Empty means
+	// the default under HoleDir; nothing else moves with it.
+	SettingsFile string
 }
 
-// DetectHost reads the host user identity.
+// DetectHost reads the host user identity and the HOLE_SETTINGS_FILE override.
 func DetectHost() Host {
 	host := Host{
-		Username: firstNonEmpty(os.Getenv("USER"), defaultUsername),
-		Home:     firstNonEmpty(os.Getenv("HOME"), defaultHome),
+		Username:     firstNonEmpty(os.Getenv("USER"), defaultUsername),
+		Home:         firstNonEmpty(os.Getenv("HOME"), defaultHome),
+		SettingsFile: os.Getenv("HOLE_SETTINGS_FILE"),
 	}
 	if runtime.GOOS == "linux" {
 		host.UID = fmt.Sprint(os.Getuid())
@@ -135,8 +139,32 @@ func (h Host) ResolveContainerPath(raw, projectDir string) string {
 // HoleDir is Hole's per-user state directory (~/.hole).
 func (h Host) HoleDir() string { return filepath.Join(h.Home, ".hole") }
 
-// GlobalSettingsFile is the path of the global settings document.
-func (h Host) GlobalSettingsFile() string { return filepath.Join(h.HoleDir(), "settings.json") }
+// GlobalSettingsFile is the path of the global settings document: HOLE_SETTINGS_FILE when set,
+// ~/.hole/settings.json otherwise.
+func (h Host) GlobalSettingsFile() string {
+	if h.SettingsFile != "" {
+		return h.SettingsFile
+	}
+	return filepath.Join(h.HoleDir(), "settings.json")
+}
+
+// ValidateSettingsFile checks the HOLE_SETTINGS_FILE override. Unlike a missing default file, a
+// missing override is fatal: falling back to defaults would start a sandbox without the
+// configuration the caller explicitly asked for.
+func (h Host) ValidateSettingsFile() error {
+	if h.SettingsFile == "" {
+		return nil
+	}
+	invalid := fmt.Errorf("HOLE_SETTINGS_FILE '%s' must be an absolute path to an existing settings file", h.SettingsFile)
+	if !filepath.IsAbs(h.SettingsFile) {
+		return invalid
+	}
+	info, err := os.Stat(h.SettingsFile)
+	if err != nil || !info.Mode().IsRegular() {
+		return invalid
+	}
+	return nil
+}
 
 // UserAgentsDir is where user-defined agent plugins live.
 func (h Host) UserAgentsDir() string { return filepath.Join(h.HoleDir(), "agents") }

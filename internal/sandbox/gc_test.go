@@ -175,7 +175,19 @@ func TestSettingsLabel(t *testing.T) {
 		"/home/dev/.hole/settings.json",
 		"/projects/demo/.hole/settings.json",
 	}
-	if got := settingsLabel(host, instance); got != "global+project" {
-		t.Errorf("settingsLabel = %q, want global+project", got)
+	if got := settingsLabel(host, instance); got != "global(~/.hole/settings.json)+project" {
+		t.Errorf("settingsLabel = %q, want global(~/.hole/settings.json)+project", got)
+	}
+
+	// A run started with HOLE_SETTINGS_FILE records the file it read; a plain `hole list` must
+	// still name it as the global document rather than a bare file name.
+	instance.SettingsFiles = []string{"/home/dev/.wrapper/hole-settings.json"}
+	if got := settingsLabel(host, instance); got != "global(~/.wrapper/hole-settings.json)" {
+		t.Errorf("settingsLabel = %q, want global(~/.wrapper/hole-settings.json)", got)
+	}
+
+	instance.SettingsFiles = []string{"/opt/wrapper/settings.json", "/projects/demo/.hole/settings.json"}
+	if got := settingsLabel(host, instance); got != "global(/opt/wrapper/settings.json)+project" {
+		t.Errorf("settingsLabel = %q, want global(/opt/wrapper/settings.json)+project", got)
 	}
 }
