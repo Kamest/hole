@@ -82,23 +82,30 @@ func agentLabel(instance *state.Instance) string {
 	return instance.Agent
 }
 
-// settingsLabel names which settings documents were merged for the run.
+// settingsLabel names which settings documents were merged for the run. The global document is
+// named by the path the run recorded, not by the listing process's GlobalSettingsFile: a run
+// started with HOLE_SETTINGS_FILE read a different file than a plain `hole list` would assume.
 func settingsLabel(host hostenv.Host, instance *state.Instance) string {
 	if len(instance.SettingsFiles) == 0 {
 		return "defaults"
 	}
 	labels := make([]string, 0, len(instance.SettingsFiles))
 	for _, file := range instance.SettingsFiles {
-		switch {
-		case file == host.GlobalSettingsFile():
-			labels = append(labels, "global")
-		case strings.HasPrefix(file, instance.ProjectPath):
+		if file == projectSettingsFile(instance.ProjectPath) {
 			labels = append(labels, "project")
-		default:
-			labels = append(labels, filepath.Base(file))
+			continue
 		}
+		labels = append(labels, "global("+abbreviateHome(host, file)+")")
 	}
 	return strings.Join(labels, "+")
+}
+
+// abbreviateHome shortens a path under the host home to its `~/` form.
+func abbreviateHome(host hostenv.Host, path string) string {
+	if relative, ok := strings.CutPrefix(path, host.Home+string(filepath.Separator)); ok && host.Home != "" {
+		return "~/" + relative
+	}
+	return path
 }
 
 func formatUptime(uptime time.Duration) string {

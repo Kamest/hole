@@ -56,7 +56,7 @@ directory to keep in sync. See [guidelines](guidelines.md#non-negotiable-rules).
 
 | Path | Contents |
 |---|---|
-| `~/.hole/settings.json` | global settings |
+| `~/.hole/settings.json` | global settings (replaced by `$HOLE_SETTINGS_FILE` when set; nothing else moves) |
 | `~/.hole/agents/<name>/` | user-defined agents |
 | `~/.hole/instances/<instance>.json` | one file per running sandbox (plus its lock files) |
 | `~/.hole/logs/run-*.log` | per-run debug logs, ~7 day retention |

@@ -266,3 +266,54 @@ func TestHoleDirectories(t *testing.T) {
 		t.Errorf("UserAgentsDir = %q", got)
 	}
 }
+
+func TestGlobalSettingsFileOverride(t *testing.T) {
+	host := Host{Home: "/home/tester"}
+	if got := host.GlobalSettingsFile(); got != "/home/tester/.hole/settings.json" {
+		t.Errorf("default GlobalSettingsFile = %q", got)
+	}
+
+	host.SettingsFile = "/opt/wrapper/settings.json"
+	if got := host.GlobalSettingsFile(); got != "/opt/wrapper/settings.json" {
+		t.Errorf("overridden GlobalSettingsFile = %q", got)
+	}
+	// Only the settings document moves: agents, trust and runtime state stay in ~/.hole.
+	unaffected := map[string]string{
+		"HoleDir":       host.HoleDir(),
+		"UserAgentsDir": host.UserAgentsDir(),
+		"InstancesDir":  host.InstancesDir(),
+		"TmpRoot":       host.TmpRoot(),
+		"LogDir":        host.LogDir(),
+	}
+	for name, got := range unaffected {
+		if !strings.HasPrefix(got, "/home/tester/.hole") {
+			t.Errorf("%s = %q moved with HOLE_SETTINGS_FILE", name, got)
+		}
+	}
+}
+
+func TestValidateSettingsFile(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(file, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]struct {
+		settingsFile string
+		wantErr      bool
+	}{
+		"unset":    {settingsFile: "", wantErr: false},
+		"relative": {settingsFile: "settings.json", wantErr: true},
+		"missing":  {settingsFile: filepath.Join(dir, "missing.json"), wantErr: true},
+		"dir":      {settingsFile: dir, wantErr: true},
+		"ok":       {settingsFile: file, wantErr: false},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := Host{Home: "/home/tester", SettingsFile: test.settingsFile}.ValidateSettingsFile()
+			if (err != nil) != test.wantErr {
+				t.Errorf("ValidateSettingsFile() error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
