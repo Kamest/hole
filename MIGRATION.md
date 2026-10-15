@@ -232,6 +232,27 @@ in a library that your global settings exclude, remove the pattern globally or e
 through `files.include`, which exclusions never reach. Expect one "matched no paths" warning per
 checkout that does not contain a globally excluded file.
 
+**Excluded directories are hidden with a per-sandbox Docker volume, and every exclusion is
+verified inside the container as soon as it is up.** In 1.x — and 2.x before this release — a directory named in
+`files.exclude` was covered with an empty directory bound from your disk. Docker Desktop's Docker
+VMM (libkrun) drops such a mount about a second after the container starts, so on that virtual
+machine manager the excluded directories were visible to the agent, with no warning and with
+`docker inspect` still reporting the mount. Directories are now covered with their own
+subdirectory of one Docker volume per sandbox (`hole-sandbox-masks-<instance>`), which the VMM
+leaves alone, and Hole checks inside the container that every excluded path really is hidden —
+refusing to start the sandbox if one is not. Consequences worth knowing: what the agent writes
+into an excluded directory now lands in that volume on Docker's disk and disappears with the
+sandbox, instead of landing in Hole's run directory on your disk; a start can now fail with a
+message naming an exposed path where it previously succeeded silently; and on an engine older than
+Docker Engine 26 / Compose 2.26, which cannot mount part of a volume (and on podman with
+podman-compose), excluded directories fall
+back to an in-memory tmpfs with a warning on every start — what is written into them then counts
+against `container.memoryLimit`, so update the engine or size the limit for a build that writes a
+lot into an excluded `target` or `node_modules`. The check runs once, right after the container is created; the
+agent process is already running at that point, so it is a check of the sandbox, not a gate in
+front of the agent. Files, which were always covered with `/dev/null`,
+are unchanged.
+
 **No more proxy environment variables.** `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` are gone from the
 sandbox, because filtering no longer happens at the HTTP layer. Anything that needed proxy
 awareness can drop it:

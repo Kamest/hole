@@ -59,6 +59,9 @@ type Instance struct {
 	Subnets     []string `json:"subnets,omitempty"`
 	DinDVolume  string   `json:"dindVolume,omitempty"`
 	DinDEnabled bool     `json:"dindEnabled"`
+	// MaskVolume is the volume whose subdirectories hide excluded directories, empty when the
+	// sandbox has none or masks them with a tmpfs.
+	MaskVolume string `json:"maskVolume,omitempty"`
 	// RegistryMirror is the pull-through cache URL given to the DinD daemon, empty when the
 	// mirror could not be started.
 	RegistryMirror string `json:"registryMirror,omitempty"`

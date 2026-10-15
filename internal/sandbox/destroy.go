@@ -26,7 +26,8 @@ func Destroy(projectDir string) error {
 	// Only this project's own repository: the shared agent image and the gateway may serve
 	// other projects.
 	removeImages(containerEngine, image.AgentRepository(projectName))
-	removeVolumes(containerEngine, "hole-sandbox-docker-data-"+instancePrefix)
+	removeVolumes(containerEngine, dindVolumePrefix+instancePrefix)
+	removeVolumes(containerEngine, maskVolumePrefix+instancePrefix)
 
 	logging.Line()
 	logging.Info("Cached resources destroyed. The shared agent and gateway images were preserved (other projects may use them).")

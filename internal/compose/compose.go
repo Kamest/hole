@@ -26,7 +26,8 @@ type Service struct {
 	Command      []string                   `yaml:"command,omitempty"`
 	Entrypoint   []string                   `yaml:"entrypoint,omitempty"`
 	Environment  []string                   `yaml:"environment,omitempty"`
-	Volumes      []string                   `yaml:"volumes,omitempty"`
+	Volumes      []ServiceVolume            `yaml:"volumes,omitempty"`
+	Tmpfs        []string                   `yaml:"tmpfs,omitempty"`
 	Networks     map[string]*ServiceNetwork `yaml:"networks,omitempty"`
 	DNS          []string                   `yaml:"dns,omitempty"`
 	ExtraHosts   []string                   `yaml:"extra_hosts,omitempty"`
@@ -50,6 +51,47 @@ type Build struct {
 	Context    string            `yaml:"context"`
 	Dockerfile string            `yaml:"dockerfile,omitempty"`
 	Args       map[string]string `yaml:"args,omitempty"`
+}
+
+// ServiceVolume is one entry of a service's `volumes` list. It is written in the short
+// `source:target[:options]` form unless Subpath is set: the short form cannot express a volume
+// subpath, so such an entry is written in the long form instead.
+type ServiceVolume struct {
+	// Spec is the short form. It is used whenever Subpath is empty.
+	Spec string
+	// Source, Target and Subpath mount one subdirectory of the named volume Source at Target.
+	Source  string
+	Target  string
+	Subpath string
+}
+
+// Binds turns short-form specs into volume entries.
+func Binds(specs ...string) []ServiceVolume {
+	volumes := make([]ServiceVolume, 0, len(specs))
+	for _, spec := range specs {
+		volumes = append(volumes, ServiceVolume{Spec: spec})
+	}
+	return volumes
+}
+
+type longVolume struct {
+	Type   string              `yaml:"type"`
+	Source string              `yaml:"source"`
+	Target string              `yaml:"target"`
+	Volume longVolumeSubOption `yaml:"volume"`
+}
+
+type longVolumeSubOption struct {
+	Subpath string `yaml:"subpath"`
+}
+
+// MarshalYAML renders the entry in whichever form it needs.
+func (v ServiceVolume) MarshalYAML() (any, error) {
+	if v.Subpath == "" {
+		return v.Spec, nil
+	}
+	return longVolume{Type: "volume", Source: v.Source, Target: v.Target,
+		Volume: longVolumeSubOption{Subpath: v.Subpath}}, nil
 }
 
 // ServiceNetwork attaches a service to a network, optionally with a fixed address.

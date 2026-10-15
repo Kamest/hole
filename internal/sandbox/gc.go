@@ -103,22 +103,24 @@ func collectContainers(containerEngine *engine.Engine, store *state.Store) {
 	}
 }
 
-// collectVolumes removes per-instance Docker-in-Docker volumes whose instance has neither a
-// network nor a container left. Volume prune has no age filter, so the liveness of sibling
-// resources is the age proxy — which is why instance volumes are created *after* the
-// networks during startup.
+// collectVolumes removes per-instance volumes — Docker-in-Docker data and exclusion masks — whose
+// instance has neither a network nor a container left. Volume prune has no age filter, so the
+// liveness of sibling resources is the age proxy — which is why instance volumes are created
+// *after* the networks during startup.
 func collectVolumes(containerEngine *engine.Engine, store *state.Store) {
-	for _, volume := range containerEngine.VolumesByName(dindVolumePrefix) {
-		instanceName := strings.TrimPrefix(volume, dindVolumePrefix)
-		if instanceName == volume || store.Exists(instanceName) {
-			continue
-		}
-		if instanceHasNetworks(containerEngine, instanceName) || len(containerEngine.Containers(instanceName)) > 0 {
-			continue
-		}
-		logging.Info("Removing orphaned Docker-in-Docker volume %s", volume)
-		if err := containerEngine.VolumeRemove(volume); err != nil {
-			logging.Warn("could not remove volume %s: %v", volume, err)
+	for _, prefix := range []string{dindVolumePrefix, maskVolumePrefix} {
+		for _, volume := range containerEngine.VolumesByName(prefix) {
+			instanceName := strings.TrimPrefix(volume, prefix)
+			if instanceName == volume || store.Exists(instanceName) {
+				continue
+			}
+			if instanceHasNetworks(containerEngine, instanceName) || len(containerEngine.Containers(instanceName)) > 0 {
+				continue
+			}
+			logging.Info("Removing orphaned volume %s", volume)
+			if err := containerEngine.VolumeRemove(volume); err != nil {
+				logging.Warn("could not remove volume %s: %v", volume, err)
+			}
 		}
 	}
 }

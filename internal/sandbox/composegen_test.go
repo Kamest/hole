@@ -117,6 +117,7 @@ func TestGenerateComposeGolden(t *testing.T) {
 		opts     Options
 		// nonInteractive drops the TTY, the way a piped or CI run does.
 		nonInteractive bool
+		maskVolume     string
 	}{
 		{
 			name:     "minimal",
@@ -137,6 +138,7 @@ func TestGenerateComposeGolden(t *testing.T) {
 				settings.Container.Docker = true
 				return settings
 			}(),
+			maskVolume: "hole-sandbox-masks-hole-sandbox-demo-abcd1234-xyz123",
 		},
 		{
 			name:     "debug",
@@ -160,7 +162,8 @@ func TestGenerateComposeGolden(t *testing.T) {
 			runTmpDir := t.TempDir()
 			in := testInput(t, projectDir, runTmpDir, test.settings, test.opts)
 			in.interactive = !test.nonInteractive
-			path, err := generateCompose(in)
+			in.maskVolume = test.maskVolume
+			path, _, err := generateCompose(in)
 			if err != nil {
 				t.Fatalf("generateCompose: %v", err)
 			}
@@ -202,7 +205,7 @@ func TestGenerateComposeMirrorsExclusionsOnDinD(t *testing.T) {
 	settings.Container.Docker = true
 
 	runTmpDir := t.TempDir()
-	path, err := generateCompose(testInput(t, projectDir, runTmpDir, settings, Options{}))
+	path, _, err := generateCompose(testInput(t, projectDir, runTmpDir, settings, Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +236,7 @@ func TestGeneratedComposePinsSidecarImageByDigest(t *testing.T) {
 	settings.Container.Docker = true
 
 	runTmpDir := t.TempDir()
-	path, err := generateCompose(testInput(t, projectDir, runTmpDir, settings, Options{}))
+	path, _, err := generateCompose(testInput(t, projectDir, runTmpDir, settings, Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,13 +267,16 @@ func TestPinnedImagesCarryNoTag(t *testing.T) {
 	}
 }
 
-func TestGenerateComposeExcludesDirectoriesWithEmptyDirs(t *testing.T) {
+// Without a mask volume — an engine that cannot mount volume subpaths — a directory is hidden by
+// a tmpfs, and by nothing that touches the host: a bind of a host path nested inside another host
+// path is what Docker Desktop's Docker VMM drops a second after start.
+func TestGenerateComposeExcludesDirectoriesWithTmpfs(t *testing.T) {
 	projectDir, _ := fixture(t)
 	settings := &config.Settings{}
 	settings.Files.Exclude = []string{"secrets"}
 
 	runTmpDir := t.TempDir()
-	path, err := generateCompose(testInput(t, projectDir, runTmpDir, settings, Options{}))
+	path, masks, err := generateCompose(testInput(t, projectDir, runTmpDir, settings, Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,14 +284,123 @@ func TestGenerateComposeExcludesDirectoriesWithEmptyDirs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Directories are hidden with an empty host directory, never an anonymous volume —
-	// `compose down` does not remove those without -v.
-	placeholder := filepath.Join(runTmpDir, "excluded-dirs", projectDir, "secrets")
-	if !strings.Contains(string(data), placeholder+":"+projectDir+"/secrets") {
-		t.Errorf("excluded directory is not backed by an empty host directory:\n%s", data)
+	excluded := projectDir + "/secrets"
+	if !strings.Contains(string(data), "tmpfs:\n            - "+excluded+":exec\n") {
+		t.Errorf("excluded directory is not masked by a tmpfs:\n%s", data)
 	}
-	if _, err := os.Stat(placeholder); err != nil {
-		t.Errorf("placeholder directory was not created: %v", err)
+	if strings.Contains(string(data), "excluded-dirs") {
+		t.Errorf("excluded directory still binds a host placeholder:\n%s", data)
+	}
+	if _, err := os.Stat(filepath.Join(runTmpDir, "excluded-dirs")); err == nil {
+		t.Error("a placeholder directory was created on the host")
+	}
+	if !reflect.DeepEqual(masks.targets, []string{excluded}) {
+		t.Errorf("mask targets = %v, want the excluded directory checked after start", masks.targets)
+	}
+	if strings.Contains(string(data), "subpath") {
+		t.Errorf("the tmpfs fallback still mounts a volume subpath:\n%s", data)
+	}
+}
+
+// With a mask volume, every excluded directory is its own subpath of the one volume, on the agent
+// and the sidecar alike, and the volume is declared external — Hole owns its lifecycle.
+func TestGenerateComposeExcludesDirectoriesWithMaskVolumeSubpaths(t *testing.T) {
+	projectDir, _ := fixture(t)
+	if err := os.MkdirAll(filepath.Join(projectDir, "build"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settings := &config.Settings{}
+	settings.Files.Exclude = []string{"secrets", ".env", "build"}
+	settings.Container.Docker = true
+
+	in := testInput(t, projectDir, t.TempDir(), settings, Options{})
+	in.maskVolume = "hole-sandbox-masks-x"
+	path, masks, err := generateCompose(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(data)
+	for _, entry := range []struct{ target, subpath string }{{"secrets", "0"}, {"build", "1"}} {
+		want := "- type: volume\n              source: hole-sandbox-masks-x\n              target: " +
+			projectDir + "/" + entry.target + "\n              volume:\n                subpath: \"" + entry.subpath + "\"\n"
+		if got := strings.Count(out, want); got != 2 {
+			t.Errorf("%s is masked by subpath %s %d times, want once on the agent and once on the sidecar:\n%s",
+				entry.target, entry.subpath, got, out)
+		}
+	}
+	if strings.Contains(out, "tmpfs:") {
+		t.Errorf("directories are masked by a tmpfs although a mask volume is set:\n%s", out)
+	}
+	if !strings.Contains(out, "    hole-sandbox-masks-x:\n        external: true\n") {
+		t.Errorf("the mask volume is not declared external:\n%s", out)
+	}
+	if !reflect.DeepEqual(masks.subpaths, []string{"0", "1"}) {
+		t.Errorf("subpaths = %v, want one per excluded directory and none for the file", masks.subpaths)
+	}
+	if !reflect.DeepEqual(masks.targets, []string{projectDir + "/secrets", projectDir + "/.env", projectDir + "/build"}) {
+		t.Errorf("mask targets = %v, want every exclusion", masks.targets)
+	}
+}
+
+// An engine that cannot mount volume subpaths gets tmpfs masks even when a mask volume is
+// offered, and the plan carries the reason so Start can warn and skip creating the volume.
+func TestGenerateComposeFallsBackToTmpfsWhenSubpathsAreUnsupported(t *testing.T) {
+	projectDir, _ := fixture(t)
+	settings := &config.Settings{}
+	settings.Files.Exclude = []string{"secrets"}
+
+	in := testInput(t, projectDir, t.TempDir(), settings, Options{})
+	in.maskVolume = "hole-sandbox-masks-x"
+	in.subpathUnsupported = func() string { return "compose 2.20.0 is older than 2.26" }
+	path, masks, err := generateCompose(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "hole-sandbox-masks-x") {
+		t.Errorf("the mask volume is referenced although subpaths are unsupported:\n%s", data)
+	}
+	if !strings.Contains(string(data), projectDir+"/secrets:exec") {
+		t.Errorf("the excluded directory is not masked by a tmpfs:\n%s", data)
+	}
+	if masks.fallbackReason != "compose 2.20.0 is older than 2.26" {
+		t.Errorf("fallback reason = %q, want the engine's", masks.fallbackReason)
+	}
+}
+
+// A sandbox with no excluded directory needs no mask volume, so the file must not reference one:
+// Start only creates the volume when there is a subpath to mount.
+func TestGenerateComposeDeclaresNoMaskVolumeWithoutExcludedDirectories(t *testing.T) {
+	projectDir, _ := fixture(t)
+	settings := &config.Settings{}
+	settings.Files.Exclude = []string{".env"}
+
+	in := testInput(t, projectDir, t.TempDir(), settings, Options{})
+	in.maskVolume = "hole-sandbox-masks-x"
+	in.subpathUnsupported = func() string {
+		t.Error("the engine was asked about volume subpaths with no directory to mask")
+		return ""
+	}
+	path, masks, err := generateCompose(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "hole-sandbox-masks-x") {
+		t.Errorf("the mask volume is referenced with no directory to mask:\n%s", data)
+	}
+	if len(masks.subpaths) != 0 {
+		t.Errorf("subpaths = %v, want none", masks.subpaths)
 	}
 }
 
@@ -305,7 +420,7 @@ func TestGenerateComposeExcludesSymlinkedDirectoriesAsDirectories(t *testing.T) 
 	settings.Files.Exclude = []string{"linked-secrets"}
 
 	runTmpDir := t.TempDir()
-	path, err := generateCompose(testInput(t, projectDir, runTmpDir, settings, Options{}))
+	path, _, err := generateCompose(testInput(t, projectDir, runTmpDir, settings, Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,9 +428,8 @@ func TestGenerateComposeExcludesSymlinkedDirectoriesAsDirectories(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	placeholder := filepath.Join(runTmpDir, "excluded-dirs", projectDir, "linked-secrets")
-	if !strings.Contains(string(data), placeholder+":"+projectDir+"/linked-secrets") {
-		t.Errorf("a symlinked excluded directory is not backed by an empty host directory:\n%s", data)
+	if !strings.Contains(string(data), "tmpfs:\n            - "+projectDir+"/linked-secrets:exec\n") {
+		t.Errorf("a symlinked excluded directory is not masked by a tmpfs:\n%s", data)
 	}
 	if strings.Contains(string(data), "/dev/null:"+projectDir+"/linked-secrets") {
 		t.Error("a symlinked excluded directory was over-mounted with /dev/null")
@@ -330,7 +444,7 @@ func TestGenerateComposeSkipsMissingPaths(t *testing.T) {
 	settings.Libraries = map[string]config.Library{"/missing/library": {Path: "/libs/missing"}}
 
 	runTmpDir := t.TempDir()
-	path, err := generateCompose(testInput(t, projectDir, runTmpDir, settings, Options{}))
+	path, _, err := generateCompose(testInput(t, projectDir, runTmpDir, settings, Options{}))
 	if err != nil {
 		t.Fatalf("missing paths must be skipped, not fatal: %v", err)
 	}
@@ -647,7 +761,7 @@ func TestFlaggedIncludeIsInertWithoutTheSidecar(t *testing.T) {
 	settings := &config.Settings{}
 	settings.Files.Include = map[string]config.Include{flaggedFile: {Path: "/opt/settings.xml", Docker: true}}
 
-	path, err := generateCompose(testInput(t, projectDir, t.TempDir(), settings, Options{}))
+	path, _, err := generateCompose(testInput(t, projectDir, t.TempDir(), settings, Options{}))
 	if err != nil {
 		t.Fatalf("a flagged include without the sidecar must not be an error: %v", err)
 	}
@@ -691,7 +805,7 @@ func TestDinDSidecarSkipsIncludesThatWereNotMounted(t *testing.T) {
 // agentServiceBlock generates the compose file and returns the agent service block from it.
 func agentServiceBlock(t *testing.T, in composeInput) string {
 	t.Helper()
-	path, err := generateCompose(in)
+	path, _, err := generateCompose(in)
 	if err != nil {
 		t.Fatalf("generateCompose: %v", err)
 	}
@@ -712,7 +826,7 @@ func agentServiceBlock(t *testing.T, in composeInput) string {
 // dindService generates the compose file and returns the docker service block from it.
 func dindService(t *testing.T, in composeInput) string {
 	t.Helper()
-	path, err := generateCompose(in)
+	path, _, err := generateCompose(in)
 	if err != nil {
 		t.Fatalf("generateCompose: %v", err)
 	}
@@ -781,7 +895,7 @@ func TestConfiguredValuesExpandHostVariables(t *testing.T) {
 
 	// End to end through the file, because expansion has to happen before `$` escaping: an
 	// expanded value must land verbatim, and an unexpanded reference must stay escaped.
-	path, err := generateCompose(in)
+	path, _, err := generateCompose(in)
 	if err != nil {
 		t.Fatalf("generateCompose: %v", err)
 	}
@@ -826,7 +940,7 @@ func TestGenerateComposeRejectsCollidingIncludeTargets(t *testing.T) {
 		filepath.Join(projectDir, "config"):  {Path: "/work/config"},
 		filepath.Join(projectDir, "secrets"): {Path: "/work/config", Docker: true},
 	}
-	_, err := generateCompose(testInput(t, projectDir, t.TempDir(), settings, Options{}))
+	_, _, err := generateCompose(testInput(t, projectDir, t.TempDir(), settings, Options{}))
 	if err == nil {
 		t.Fatal("two includes targeting the same container path must be fatal")
 	}
@@ -850,7 +964,7 @@ func TestGenerateComposeExportsThePoolDirectoryOnlyWhenMounted(t *testing.T) {
 		Links: []worktree.Link{{HostPath: poolDir, ReadWrite: true}},
 		Pool:  poolDir,
 	}
-	path, err := generateCompose(withPool)
+	path, _, err := generateCompose(withPool)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -866,7 +980,7 @@ func TestGenerateComposeExportsThePoolDirectoryOnlyWhenMounted(t *testing.T) {
 		t.Errorf("the pool is not mounted read-write at its host path:\n%s", data)
 	}
 
-	path, err = generateCompose(testInput(t, projectDir, t.TempDir(), &config.Settings{}, Options{}))
+	path, _, err = generateCompose(testInput(t, projectDir, t.TempDir(), &config.Settings{}, Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}

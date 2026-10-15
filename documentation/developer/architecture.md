@@ -63,6 +63,7 @@ directory to keep in sync. See [guidelines](guidelines.md#non-negotiable-rules).
 | `~/.hole/tmp/run.XXXXXX/` | per-run generated artifacts |
 | `~/.hole/state.json` | the last version that completed a run |
 | `~/.hole/trust.json` | project paths whose settings the user accepted, and what they accepted |
+| `~/.hole/subpath-probe.json` | the engine version the volume-subpath probe last passed on ([configuration](configuration.md#filesexclude)) |
 
 The run temp directory lives under `$HOME` rather than `$TMPDIR` because Colima, Lima and
 Podman-Machine VMs share `$HOME` but not `/var/folders`, and generated files there must be
@@ -85,6 +86,32 @@ Services:
 - `docker` (optional) — a `docker:dind-rootless` sidecar (privileged container, unprivileged
   daemon). See [configuration](configuration.md#docker-in-docker).
 
+Volumes per instance, both created by Hole and referenced as `external`:
+
+- `hole-sandbox-docker-data-<instance>` — the DinD daemon's data root, when DinD is enabled.
+- `hole-sandbox-masks-<instance>` — the mask volume, when anything excluded is a directory: one
+  subdirectory per excluded directory, mounted with `subpath` over it on the agent and the
+  sidecar. See [configuration](configuration.md#filesexclude).
+
+### The gateway image is also the helper image
+
+Besides the gateway service, the gateway image hosts every one-shot host helper that needs a
+shell: `hole-bridge-netfilter` (`Engine.RunHostHelper`, at start and teardown) and the mask
+volume's preparation and subpath probe (`Engine.RunVolumeHelper`, at start). It is the image for
+the job because it is built locally from embedded assets, pinned by content hash, garbage-collected
+already, and — since `compose up gateway` runs first — guaranteed to exist before any other service
+starts. The agent image is not: it is built inside `compose up agent`, so on a first start or with
+`-r` it does not exist yet when the helpers run. A dedicated helper image was rejected (a pulled
+one adds an unpinned registry dependency to the start path, a built one adds a second Dockerfile,
+tag and GC rule for a `mkdir`), and so was renaming the image (a one-off migration that orphans
+every existing `hole-gateway:*` image for no functional gain). `state.Instance.GatewayImage` is
+recorded so teardown runs the helper of the version that started the sandbox.
+
+The volume helpers run with `--rm`, `--network none` and the image's entrypoint bypassed, and are
+named `<instance>-maskprep-1` / `<instance>-maskprobe-1` — the shape compose gives its own
+containers — so one left behind by an interrupted start is swept by the container GC pass.
+`RunHostHelper` (`--network host`, `NET_ADMIN`) is deliberately not reused for them.
+
 ## Startup sequence
 
 1. Resolve host identity, project name and instance ID; create the run temp directory.
@@ -98,8 +125,14 @@ Services:
 6. Run the version-change migration and garbage collection.
 7. Allocate and create the two networks, then the DinD volume — in that order, so a half-started
    instance is always recognisable by its network.
-8. Materialize the build contexts and gateway configuration; generate one compose file.
-9. `compose up -d` per service: gateway → docker (if enabled) → agent. Health gating comes from
+8. Materialize the build contexts and gateway configuration; generate one compose file. Directory
+   masks are generated as subpaths of the mask volume unless the compose plugin is older than
+   2.26; the mask volume is created right after, and only when there is a directory to mask.
+9. `compose up -d` per service: gateway → docker (if enabled) → agent. Between the gateway and the
+   next service, the mask volume's subpaths are prepared and one is probe-mounted over the gateway
+   image; if either fails, the volume is removed, a warning names the engine, and the compose file
+   is regenerated with tmpfs masks (the gateway's definition is identical in both files, so compose
+   leaves it running). Health gating comes from
    compose `depends_on: condition: service_healthy`. Just before the agent service — and only
    without `-r` — an existing `hole-sandbox/agent-*` image carrying the target tag is re-tagged into
    this project's repository, so a sibling checkout adopts a bit-identical image instead of
@@ -199,7 +232,7 @@ started earlier holds a snapshot with no networks in it.
 
 Phases: `-n` dump → `compose down --remove-orphans` (fileless, `-p` only, so teardown never
 depends on generated files) → registry mirror detach → explicit removal of both networks with an
-attached-container force fallback → DinD volume → registry mirror stop when this was the last
+attached-container force fallback → DinD volume → mask volume → registry mirror stop when this was the last
 instance → `cleanupHost` hooks → run directory → state file → a final verification pass that
 names any leftover and prints the command to remove it.
 
@@ -232,7 +265,7 @@ it removes might belong to a concurrent start:
 | Abandoned instances | CLI lock free **and** watchdog PID dead → full teardown, including running containers |
 | Networks | runtime prune filtered by `hole.managed` **and** `until=10m`, so a start that created its networks but no containers yet is safe |
 | Containers | stopped sandbox containers whose instance has no state file, no running sibling and **no networks left** (compose has a window where networks exist but containers do not) |
-| Volumes | per-instance DinD volumes whose instance has neither network nor container — volume prune has no age filter, so sibling liveness is the age proxy |
+| Volumes | per-instance DinD and mask volumes whose instance has neither network nor container — volume prune has no age filter, so sibling liveness is the age proxy |
 | Run directories | `~/.hole/tmp/run.*` older than a day that no registered instance owns |
 | Run logs | older than 7 days |
 
@@ -243,7 +276,7 @@ build could have destroyed the last working image. See
 ## Destroy
 
 - `hole destroy <path>` — containers, networks, that project's own image repository, and DinD
-  volumes for one project. The shared agent image and the gateway image are preserved; they may
+  and mask volumes for one project. The shared agent image and the gateway image are preserved; they may
   serve other projects.
 - `hole destroy` — everything Hole owns, including the registry mirror.
 
@@ -262,8 +295,16 @@ build could have destroyed the last working image. See
 
 - The project is mounted read-write at the **same absolute path** as on the host, and is the
   container working directory.
-- Secrets are hidden by over-mounting: files get `/dev/null`, directories get an empty host
-  directory. Never anonymous volumes — `compose down` leaks those without `-v`.
+- Secrets are hidden by masking the path: files get a `/dev/null` over-mount, directories get an
+  empty subdirectory of the per-sandbox mask volume (a tmpfs on an engine that cannot mount volume
+  subpaths). Never a bind of a host directory — Docker Desktop's Docker VMM drops a bind nested
+  inside another host bind about a second after start — and never an anonymous volume, which
+  `compose down` leaks without `-v`.
+- Every mask is **verified inside the running container** once, as soon as it is up and before
+  the terminal is attached (`verifyMasks`, `internal/sandbox/maskcheck.go`); a missing one aborts
+  the start. `docker
+  inspect` keeps reporting a mount the container's kernel no longer has, so the host's view cannot
+  be trusted for this.
 - `files.include` and `libraries` are opt-in; libraries are read-only by default, and an include
   reaches the Docker-in-Docker sidecar only when marked `docker`.
 

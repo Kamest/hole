@@ -304,7 +304,11 @@ func Start(opts Options) (exitCode int, err error) {
 		return 1, err
 	}
 
-	composeFile, err := generateCompose(composeInput{
+	// Offered to the generator, which asks the engine only when there is a directory to mask; the
+	// probe after the gateway can still revoke it.
+	maskVolume := maskVolumePrefix + instanceName
+
+	in := composeInput{
 		instanceName:   instanceName,
 		projectName:    projectName,
 		runTmpDir:      runTmpDir,
@@ -325,13 +329,34 @@ func Start(opts Options) (exitCode int, err error) {
 		policy:         policy,
 		dockerEnabled:  dockerEnabled,
 		dindVolume:     instance.DinDVolume,
+		maskVolume:     maskVolume,
+		subpathUnsupported: func() string {
+			return subpathUnsupportedReason(containerEngine)
+		},
 		registryMirror: instance.RegistryMirror,
 		gitLayout:      gitLayout,
 		interactive:    engine.IsTerminal(os.Stdin),
 		opts:           opts,
-	})
+	}
+	composeFile, masks, err := generateCompose(in)
 	if err != nil {
 		return 1, err
+	}
+	switch {
+	case len(masks.subpaths) == 0:
+		// No directory is excluded, so neither the volume nor the warning is needed.
+	case masks.fallbackReason != "":
+		warnTmpfsFallback(containerEngine, masks.fallbackReason)
+	default:
+		// Created after the networks and once the instance is registered, like the DinD volume,
+		// so GC cannot mistake it for an orphan of a dead sandbox.
+		instance.MaskVolume = maskVolume
+		if err := containerEngine.VolumeCreate(maskVolume, resourceLabels(instanceName, projectName)); err != nil {
+			return 1, fmt.Errorf("create mask volume: %w", err)
+		}
+		if err := store.Write(instance); err != nil {
+			logging.Warn("could not update the instance registry: %v", err)
+		}
 	}
 
 	logging.Info("Starting network gateway...")
@@ -344,6 +369,27 @@ func Start(opts Options) (exitCode int, err error) {
 	// before the agent — so the agent never runs a moment without working egress.
 	if err := applyBridgeNetfilterFix(containerEngine, store, instance, settings, sandboxNet.name, gatewayImage); err != nil {
 		return 1, err
+	}
+
+	// After the gateway, whose image the helpers run over, and before any service mounts a subpath.
+	if instance.MaskVolume != "" {
+		if err := prepareMaskVolume(containerEngine, gatewayImage, instanceName, instance.MaskVolume,
+			masks.subpaths, host.BuildUID()+":"+host.BuildGID(), filepath.Join(host.HoleDir(), subpathProbeFile)); err != nil {
+			warnTmpfsFallback(containerEngine, err.Error())
+			// The gateway's own definition is the same in both files, so compose leaves it running.
+			in.maskVolume = ""
+			if composeFile, masks, err = generateCompose(in); err != nil {
+				return 1, err
+			}
+			if err := containerEngine.VolumeRemove(instance.MaskVolume); err != nil {
+				logging.Warn("could not remove mask volume %s: %v", instance.MaskVolume, err)
+			} else {
+				instance.MaskVolume = ""
+				if err := store.Write(instance); err != nil {
+					logging.Warn("could not update the instance registry: %v", err)
+				}
+			}
+		}
 	}
 
 	if dockerEnabled {
@@ -371,11 +417,27 @@ func Start(opts Options) (exitCode int, err error) {
 		return 1, err
 	}
 
+	agentContainer := instanceName + "-agent-1"
+	// Checked once, as soon as the container is up and before the terminal is attached. The agent
+	// process is already running at this point — compose starts it — so this is not a gate in
+	// front of it, but it is as early as the container's mount table can be read at all. An
+	// exclusion the runtime failed to apply means the agent can read what the settings hide, so
+	// the deferred teardown must destroy the sandbox rather than the CLI carry on. The sidecar is
+	// checked too — its mirrored mounts are what keeps the daemon from being used to read around
+	// the agent's own.
+	if err := verifyMasks(containerEngine, agentContainer, masks.targets); err != nil {
+		return 1, err
+	}
+	if dockerEnabled {
+		if err := verifyMasks(containerEngine, instanceName+"-docker-1", masks.targets); err != nil {
+			return 1, err
+		}
+	}
+
 	// Only now that a working image exists: a failed build must not have removed the previous
 	// one first.
 	collectImages(containerEngine, projectName, imageIdentity, gatewayImage)
 
-	agentContainer := instanceName + "-agent-1"
 	logging.Info("Attaching to %s agent...", opts.Agent)
 	logging.Line()
 
