@@ -50,7 +50,7 @@ func TestSettingsFileOverrideKeepsTildeOnTheRealHome(t *testing.T) {
 		t.Errorf("dependencies = %v, want only the override's", settings.Dependencies)
 	}
 
-	builder := newMountBuilder(host, t.TempDir())
+	builder := newMountBuilder(host)
 	if err := builder.addIncludes(settings.Files.Include, projectDir); err != nil {
 		t.Fatal(err)
 	}
