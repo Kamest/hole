@@ -25,6 +25,7 @@ internal/state/        instance registry under ~/.hole/instances
 internal/trust/        per-project consent for host-affecting project settings
 internal/worktree/     git worktree detection: the libraries it implies and the worktree pool
 internal/dindregistry/ the long-lived pull-through image cache
+internal/agentversion/ agent version check: parsing, latest-version fetch, state file, prompt
 internal/update/       release discovery, self-update, version-change migration, uninstall
 internal/logging/      slog setup: console handler + per-run JSON file handler
 internal/version/      version stamping
@@ -63,6 +64,7 @@ directory to keep in sync. See [guidelines](guidelines.md#non-negotiable-rules).
 | `~/.hole/tmp/run.XXXXXX/` | per-run generated artifacts |
 | `~/.hole/state.json` | the last version that completed a run |
 | `~/.hole/trust.json` | project paths whose settings the user accepted, and what they accepted |
+| `~/.hole/agent-versions.json` | agent versions per image ID, last fetched latest versions, skipped updates ([agents](agents.md#in-place-agent-updates)); removed by `hole uninstall` with the rest of `~/.hole` |
 | `~/.hole/subpath-probe.json` | the engine version the volume-subpath probe last passed on ([configuration](configuration.md#filesexclude)) |
 
 The run temp directory lives under `$HOME` rather than `$TMPDIR` because Colima, Lima and
@@ -109,7 +111,9 @@ recorded so teardown runs the helper of the version that started the sandbox.
 
 The volume helpers run with `--rm`, `--network none` and the image's entrypoint bypassed, and are
 named `<instance>-maskprep-1` / `<instance>-maskprobe-1` — the shape compose gives its own
-containers — so one left behind by an interrupted start is swept by the container GC pass.
+containers — so one left behind by an interrupted start is swept by the container GC pass. The
+agent version probe (`RunThrowaway`) follows the same rule as `<instance>-versionprobe-1`, and is
+removed outright when it times out.
 `RunHostHelper` (`--network host`, `NET_ADMIN`) is deliberately not reused for them.
 
 ## Startup sequence
@@ -121,7 +125,14 @@ containers — so one left behind by an interrupted start is swept by the contai
    the agent registry and verify the startup agent is enabled.
 4. Resolve `cleanupHost` hooks and snapshot the merged settings into the state file, so teardown
    works even if the next step aborts.
-5. Build the egress policy, resolve the image identity, run `setupHost` hooks.
+5. Build the egress policy and resolve the image identity. Without `-r`, adopt a sibling's
+   bit-identical image (an existing `hole-sandbox/agent-*` image carrying the target tag is
+   re-tagged into this project's repository, so it counts as existing from here on —
+   [configuration](configuration.md#image-identity-and-scope)), print the banner, then run the
+   agent version check and any in-place agent update it or `--update-agents` asked for
+   ([agents](agents.md#in-place-agent-updates)) — before any network or host hook, because a
+   growth-guard `Y` turns the run into a `-r` run. An update failure only warns; a signal during it
+   ends the start. Then run `setupHost` hooks.
 6. Run the version-change migration and garbage collection.
 7. Allocate and create the two networks, then the DinD volume — in that order, so a half-started
    instance is always recognisable by its network.
@@ -133,10 +144,7 @@ containers — so one left behind by an interrupted start is swept by the contai
    image; if either fails, the volume is removed, a warning names the engine, and the compose file
    is regenerated with tmpfs masks (the gateway's definition is identical in both files, so compose
    leaves it running). Health gating comes from
-   compose `depends_on: condition: service_healthy`. Just before the agent service — and only
-   without `-r` — an existing `hole-sandbox/agent-*` image carrying the target tag is re-tagged into
-   this project's repository, so a sibling checkout adopts a bit-identical image instead of
-   rebuilding it ([configuration](configuration.md#image-identity-and-scope)).
+   compose `depends_on: condition: service_healthy`.
 10. `docker attach` the agent container. Raw mode, terminal resize and Ctrl-C proxying stay the
     runtime CLI's problem, which is the main reason Hole shells out rather than using the Engine
     API.
@@ -268,6 +276,7 @@ it removes might belong to a concurrent start:
 | Volumes | per-instance DinD and mask volumes whose instance has neither network nor container — volume prune has no age filter, so sibling liveness is the age proxy |
 | Run directories | `~/.hole/tmp/run.*` older than a day that no registered instance owns |
 | Run logs | older than 7 days |
+| Update references | `hole-sandbox/agent-update:<instanceID>` and `:<instanceID>-base` whose instance ID is not in the registry — an update interrupted by a kill; skipped when the registry cannot be read |
 
 Image GC is separate and runs only *after* the agent service is up — never before, or a failed
 build could have destroyed the last working image. See

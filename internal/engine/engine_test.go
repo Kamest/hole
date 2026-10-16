@@ -1,6 +1,63 @@
 package engine
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
+
+func TestParseImageInspect(t *testing.T) {
+	tests := []struct {
+		name    string
+		out     string
+		want    ImageInfo
+		wantErr bool
+	}{
+		{
+			name: "docker",
+			out:  "sha256:7bd5\t123\t{\"Cmd\":[\"/bin/sh\"],\"Labels\":{\"com.hole.image\":\"agent\"}}\n",
+			want: ImageInfo{ID: "sha256:7bd5", Size: 123, Labels: map[string]string{"com.hole.image": "agent"}},
+		},
+		{
+			name: "podman bare hex",
+			out:  "7bd5ab\t42\t{\"Labels\":{\"a\":\"b\"}}",
+			want: ImageInfo{ID: "7bd5ab", Size: 42, Labels: map[string]string{"a": "b"}},
+		},
+		{
+			name: "null labels",
+			out:  "sha256:7bd5\t1\t{\"Labels\":null}\n",
+			want: ImageInfo{ID: "sha256:7bd5", Size: 1, Labels: map[string]string{}},
+		},
+		{
+			name: "labels omitted by the containerd store",
+			out:  "sha256:7bd5\t1\t{\"Cmd\":[\"/bin/sh\"],\"WorkingDir\":\"/\"}\n",
+			want: ImageInfo{ID: "sha256:7bd5", Size: 1, Labels: map[string]string{}},
+		},
+		{
+			name: "null config",
+			out:  "sha256:7bd5\t1\tnull\n",
+			want: ImageInfo{ID: "sha256:7bd5", Size: 1, Labels: map[string]string{}},
+		},
+		{
+			name: "spaces and escaped tabs",
+			out:  "sha256:7bd5\t1\t{\"Labels\":{\"a b\":\"x\\ty z\"},\"Env\":[\"A=1\\t2\"]}\n",
+			want: ImageInfo{ID: "sha256:7bd5", Size: 1, Labels: map[string]string{"a b": "x\ty z"}},
+		},
+		{name: "bad size", out: "sha256:7bd5\tbig\tnull", wantErr: true},
+		{name: "missing fields", out: "sha256:7bd5\t1", wantErr: true},
+		{name: "bad labels", out: "sha256:7bd5\t1\t{", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseImageInspect(test.out)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("parseImageInspect(%q) error = %v, wantErr %v", test.out, err, test.wantErr)
+			}
+			if !test.wantErr && !reflect.DeepEqual(got, test.want) {
+				t.Errorf("parseImageInspect(%q) = %+v, want %+v", test.out, got, test.want)
+			}
+		})
+	}
+}
 
 // The cases named "podman" are what the parity job caught: podman answers a `reference=` filter
 // at image granularity and qualifies names with their registry, so an unrelated tag of a shared
@@ -54,9 +111,31 @@ func TestSplitReference(t *testing.T) {
 		{"localhost:5000/hole-sandbox/agent-foo:abc123", "localhost:5000/hole-sandbox/agent-foo", "abc123"},
 	}
 	for _, test := range tests {
-		name, tag := splitReference(test.reference)
+		name, tag := SplitReference(test.reference)
 		if name != test.name || tag != test.tag {
-			t.Errorf("splitReference(%q) = (%q, %q), want (%q, %q)", test.reference, name, tag, test.name, test.tag)
+			t.Errorf("SplitReference(%q) = (%q, %q), want (%q, %q)", test.reference, name, tag, test.name, test.tag)
 		}
+	}
+}
+
+func TestParseBuilder(t *testing.T) {
+	// The builder's own lines come first; the node list repeats Name and carries no Driver.
+	out := "Name:          colima\nDriver:        docker\nLast Activity: 2026-10-14 14:04:45 +0000 UTC\n\n" +
+		"Nodes:\nName:             colima\nEndpoint:         colima\nStatus:           running\n"
+	info, err := parseBuilder(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != "colima" || info.Driver != "docker" {
+		t.Errorf("parseBuilder = %+v, want colima/docker", info)
+	}
+
+	info, err = parseBuilder("Name:   remote-builder\nDriver: docker-container\n")
+	if err != nil || info.Driver != "docker-container" {
+		t.Errorf("parseBuilder = %+v, %v", info, err)
+	}
+
+	if _, err := parseBuilder("ERROR: no builder\n"); err == nil {
+		t.Error("output without a driver was accepted")
 	}
 }

@@ -50,6 +50,9 @@ type Options struct {
 	// TrustProject accepts the project settings' host-affecting keys without asking, for
 	// runs with no terminal to prompt on.
 	TrustProject bool
+	// UpdateAgents updates every enabled agent that has an update script inside the existing
+	// image before the start, without a full rebuild.
+	UpdateAgents bool
 	// Libraries are raw --library values: PATH[:MOUNT][:rw].
 	Libraries []string
 	AgentArgs []string
@@ -215,6 +218,13 @@ func Start(opts Options) (exitCode int, err error) {
 	gatewayImage := image.GatewayImage(assets.BuildInputsHash())
 	instance.GatewayImage = gatewayImage
 
+	// A sibling workspace of the same project holds a bit-identical image under its own path-keyed
+	// repository, and re-tagging it turns the build into a no-op. Before the agent version check,
+	// so an adopted image counts as existing.
+	if !opts.Rebuild {
+		adoptExistingImage(containerEngine, imageIdentity)
+	}
+
 	if opts.Debug {
 		logging.Warn("Debug mode: opening bash shell instead of agent CLI")
 		logging.Line()
@@ -225,8 +235,49 @@ func Start(opts Options) (exitCode int, err error) {
 	if opts.Profile != "" {
 		logging.Info("Profile: %s", opts.Profile)
 	}
-	logging.Info("Agent image: %s", imageIdentity.Describe())
+	var agentImage engine.ImageInfo
+	agentImageFound := false
+	if !opts.Rebuild {
+		var err error
+		agentImage, agentImageFound, err = containerEngine.ImageInspect(imageIdentity.Reference())
+		if err != nil {
+			logging.Warn("could not read the agent image: %v", err)
+			agentImageFound = false
+		}
+	}
+	logging.Info("Agent image: %s", describeAgentImage(imageIdentity, agentImage, agentImageFound))
 	logging.Line()
+
+	updater := &agentUpdater{
+		engine:       containerEngine,
+		host:         host,
+		reference:    imageIdentity.Reference(),
+		runTmpDir:    runTmpDir,
+		instanceID:   instanceID,
+		instanceName: instanceName,
+		enabled:      enabledAgents,
+		interactive:  engine.IsTerminal(os.Stdin),
+		in:           os.Stdin,
+		out:          os.Stderr,
+		statePath:    host.AgentVersionsFile(),
+		interrupted:  func() bool { return signalled.Load() != 0 },
+		image:        agentImage,
+		imageFound:   agentImageFound,
+	}
+	cleanRebuild := updater.prepare(opts.Rebuild, opts.UpdateAgents, agentUpdateCheckEnabled(settings))
+	// An interrupted update build only warns — it must not fail the start — so the signal is the
+	// one thing that says the user wanted out.
+	if signalled.Load() != 0 {
+		return 1, fmt.Errorf("interrupted during the agent update")
+	}
+	if cleanRebuild {
+		// The growth guard's answer: the same path as -r.
+		opts.Rebuild = true
+		instance.Flags.Rebuild = true
+		if err := store.Write(instance); err != nil {
+			logging.Warn("could not update the instance registry: %v", err)
+		}
+	}
 
 	if opts.Rebuild {
 		removeForRebuild(containerEngine, imageIdentity.Reference(), gatewayImage)
@@ -401,12 +452,6 @@ func Start(opts Options) (exitCode int, err error) {
 			reportServiceStartFailure(containerEngine, instanceName, "docker")
 			return 1, err
 		}
-	}
-
-	// Before compose looks: a sibling workspace of the same project holds a bit-identical image
-	// under its own path-keyed repository, and re-tagging it here turns the build into a no-op.
-	if !opts.Rebuild {
-		adoptExistingImage(containerEngine, imageIdentity)
 	}
 
 	logging.Info("Starting %s agent...", opts.Agent)
@@ -643,7 +688,7 @@ func resolveImage(projectName string, merged, globalOnly *config.Settings, regis
 		return image.Identity{}, err
 	}
 
-	globalEnabled, err := registry.ResolveEnabled(globalOnly.Container.EnabledAgents)
+	globalEnabled, err := registry.ResolveEnabledUnchecked(globalOnly.Container.EnabledAgents)
 	if err != nil {
 		// A global file naming an agent this machine no longer has must not break the run; the
 		// merged configuration is what actually gets built.
@@ -696,14 +741,15 @@ func userAgentHashes(enabledAgents []*agents.Agent) ([]string, error) {
 	return hashes, nil
 }
 
-// hashAgentDir digests a user agent's plugin files so editing one invalidates the image.
+// hashAgentDir digests a user agent's plugin files so editing one invalidates the image. Update-only
+// files are left out: they are not part of the image.
 func hashAgentDir(agent *agents.Agent) (string, error) {
 	var parts []string
 	err := fs.WalkDir(agent.Dir, ".", func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if entry.IsDir() {
+		if entry.IsDir() || assets.UpdateOnlyFile(path) {
 			return nil
 		}
 		data, err := fs.ReadFile(agent.Dir, path)
@@ -1000,6 +1046,24 @@ func reportServiceStartFailure(containerEngine *engine.Engine, instanceName, ser
 	for _, line := range lines {
 		logging.Warn("  %s", line)
 	}
+}
+
+// describeAgentImage renders the image for the start banner, with its in-place update history
+// when it has one.
+func describeAgentImage(identity image.Identity, info engine.ImageInfo, found bool) string {
+	if !found {
+		return identity.Describe()
+	}
+	generation := generationFromLabels(info.Size, info.Labels).describe()
+	if generation == "" {
+		return identity.Describe()
+	}
+	return identity.Describe() + " — " + generation
+}
+
+// agentUpdateCheckEnabled resolves container.agentUpdateCheck, which defaults to on.
+func agentUpdateCheckEnabled(settings *config.Settings) bool {
+	return settings.Container.AgentUpdateCheck == nil || *settings.Container.AgentUpdateCheck
 }
 
 // cachebustValue is a fresh value on rebuild so every Dockerfile layer after

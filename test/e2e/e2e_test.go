@@ -10,6 +10,8 @@ package e2e
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -555,6 +557,71 @@ func TestDestroyRemovesProjectResources(t *testing.T) {
 		"--format", "{{.Repository}}:{{.Tag}}"); images != "" {
 		t.Errorf("destroy left project images behind: %s", images)
 	}
+}
+
+// The test agent gets the full update contract: an install script writing version 1.0.0, an update
+// script writing 2.0.0, and a version.json whose latest version the test serves itself.
+func TestAgentUpdateCheckAndInPlaceUpdate(t *testing.T) {
+	latest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("2.0.0"))
+	}))
+	defer latest.Close()
+
+	home, projectDir := environment(t, `["bash", "-c", "echo AGENT_VERSION=$(cat $HOME/.test-agent-version)"]`, "")
+	agentDir := filepath.Join(home, ".hole", "agents", "test-agent")
+	write(t, filepath.Join(agentDir, "install-user.sh"), "#!/bin/bash\necho 1.0.0 > \"$HOME/.test-agent-version\"\n")
+	write(t, filepath.Join(agentDir, "update-user.sh"), "#!/bin/bash\necho 2.0.0 > \"$HOME/.test-agent-version\"\n")
+	write(t, filepath.Join(agentDir, "version.json"),
+		`{"command": ["cat", "$HOME/.test-agent-version"], "latest": {"url": "`+latest.URL+`/latest"}}`)
+
+	// First start: no image yet, so nothing is checked — the build installs the newest anyway.
+	output, code := runHole(t, home, 20*time.Minute, "start", "test-agent", projectDir)
+	if code != 0 {
+		t.Fatalf("initial start exited with %d:\n%s", code, output)
+	}
+	if !strings.Contains(output, "AGENT_VERSION=1.0.0") || strings.Contains(output, "Agent updates available") {
+		t.Fatalf("unexpected first start:\n%s", output)
+	}
+
+	// Second start: the check finds 2.0.0; without a terminal it only names the flag.
+	output, code = runHole(t, home, 10*time.Minute, "start", "test-agent", projectDir)
+	if code != 0 {
+		t.Fatalf("second start exited with %d:\n%s", code, output)
+	}
+	if !strings.Contains(output, "Agent updates available: test-agent 1.0.0 → 2.0.0") ||
+		!strings.Contains(output, "--update-agents") {
+		t.Errorf("the update was not offered:\n%s", output)
+	}
+	if !strings.Contains(output, "AGENT_VERSION=1.0.0") {
+		t.Errorf("the image changed without being asked to:\n%s", output)
+	}
+
+	// Third start: the in-place update, validated and retagged before the agent starts.
+	output, code = runHole(t, home, 10*time.Minute, "start", "test-agent", projectDir, "--update-agents")
+	if code != 0 {
+		t.Fatalf("update start exited with %d:\n%s", code, output)
+	}
+	if !strings.Contains(output, "Agents updated: test-agent 1.0.0 → 2.0.0") ||
+		!strings.Contains(output, "AGENT_VERSION=2.0.0") {
+		t.Errorf("the agent was not updated in place:\n%s", output)
+	}
+
+	// Fourth start: up to date, and the banner shows the image's update history.
+	output, code = runHole(t, home, 10*time.Minute, "start", "test-agent", projectDir)
+	if code != 0 {
+		t.Fatalf("fourth start exited with %d:\n%s", code, output)
+	}
+	if strings.Contains(output, "Agent updates available") {
+		t.Errorf("an installed version was offered again:\n%s", output)
+	}
+	if !strings.Contains(output, "1 agent update since clean build") || !strings.Contains(output, "AGENT_VERSION=2.0.0") {
+		t.Errorf("the updated image was not used:\n%s", output)
+	}
+	if leftovers := dockerOutput(t, "images", "--filter", "reference=hole-sandbox/agent-update",
+		"--format", "{{.Repository}}:{{.Tag}}"); leftovers != "" {
+		t.Errorf("temporary update references were left behind: %s", leftovers)
+	}
+	assertNoLeftovers(t, projectDir)
 }
 
 func TestDebugModeOpensShell(t *testing.T) {

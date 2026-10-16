@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lukashornych/hole/v2/internal/agents"
 	"github.com/lukashornych/hole/v2/internal/config"
 	"github.com/lukashornych/hole/v2/internal/network"
 	"github.com/lukashornych/hole/v2/internal/worktree"
@@ -96,5 +97,37 @@ func TestEnsureWorktreePoolRejectsANonDirectory(t *testing.T) {
 	}
 	if err := ensureWorktreePool(pool); err == nil {
 		t.Error("a file in the pool's place was accepted")
+	}
+}
+
+// A user agent's update-only files are not part of the image, so editing one keeps the image tag.
+func TestHashAgentDirIgnoresUpdateOnlyFiles(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("install-user.sh", "install")
+	write("update-user.sh", "update")
+	write("version.json", "{}")
+	agent := &agents.Agent{Name: "custom", Dir: os.DirFS(dir)}
+	hash := func() string {
+		value, err := hashAgentDir(agent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	reference := hash()
+	write("update-user.sh", "changed")
+	write("update-root.sh", "new")
+	write("version.json", `{"changed": true}`)
+	if hash() != reference {
+		t.Error("editing an update-only file changed the agent hash")
+	}
+	write("install-user.sh", "changed")
+	if hash() == reference {
+		t.Error("editing install-user.sh did not change the agent hash")
 	}
 }

@@ -11,7 +11,9 @@ import (
 	"embed"
 	"encoding/hex"
 	"io/fs"
+	"path"
 	"sort"
+	"strings"
 )
 
 //go:embed agents gateway schema
@@ -44,17 +46,32 @@ func Schema() []byte {
 	return data
 }
 
-// BuildInputsHash is a stable digest of every embedded asset. It participates in the
-// agent image tag so a Hole upgrade that changes a Dockerfile, entrypoint or install
-// script invalidates cached images without the user asking for a rebuild.
+// UpdateOnlyFile reports whether a file of an agent directory (a path relative to it) is used
+// only by in-place agent updates. Such files are not part of the image, and the update build reads
+// the current ones, so they stay out of the image hashes: changing one must not rebuild images.
+func UpdateOnlyFile(name string) bool {
+	switch name {
+	case "update-root.sh", "update-user.sh", "version.json":
+		return true
+	}
+	return false
+}
+
+// BuildInputsHash is a stable digest of every embedded asset except the update-only files. It
+// participates in the agent image tag so a Hole upgrade that changes a Dockerfile, entrypoint or
+// install script invalidates cached images without the user asking for a rebuild.
 func BuildInputsHash() string {
+	return buildInputsHash(FS)
+}
+
+func buildInputsHash(fsys fs.FS) string {
 	var paths []string
-	err := fs.WalkDir(FS, ".", func(path string, d fs.DirEntry, err error) error {
+	err := fs.WalkDir(fsys, ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !d.IsDir() {
-			paths = append(paths, path)
+		if !d.IsDir() && !updateOnlyAsset(name) {
+			paths = append(paths, name)
 		}
 		return nil
 	})
@@ -65,7 +82,7 @@ func BuildInputsHash() string {
 
 	h := sha1.New()
 	for _, p := range paths {
-		data, err := FS.ReadFile(p)
+		data, err := fs.ReadFile(fsys, p)
 		if err != nil {
 			panic(err)
 		}
@@ -75,4 +92,14 @@ func BuildInputsHash() string {
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// updateOnlyAsset reports whether an embedded path is the update Dockerfile or an update-only file
+// of a builtin agent.
+func updateOnlyAsset(name string) bool {
+	if name == "agents/Dockerfile.update" {
+		return true
+	}
+	agentFile, ok := strings.CutPrefix(name, "agents/")
+	return ok && path.Dir(agentFile) != "." && UpdateOnlyFile(strings.SplitN(agentFile, "/", 2)[1])
 }

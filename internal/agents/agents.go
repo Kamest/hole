@@ -5,10 +5,12 @@
 package agents
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,6 +22,10 @@ import (
 // NamePattern is the allowed agent name shape. It excludes `:` because the CLI splits the
 // agent positional on the first colon to select a profile.
 var NamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+// npmPackagePattern is the shape of an npm package name, optionally scoped. It keeps a
+// version.json from smuggling a path or query into the registry URL.
+var npmPackagePattern = regexp.MustCompile(`^(@[a-z0-9~-][a-z0-9._~-]*/)?[a-z0-9~-][a-z0-9._~-]*$`)
 
 // Source distinguishes builtin agents from user-provided ones.
 type Source string
@@ -36,6 +42,9 @@ const (
 	allowFile       = "allow.txt"
 	installRootFile = "install-root.sh"
 	installUserFile = "install-user.sh"
+	updateRootFile  = "update-root.sh"
+	updateUserFile  = "update-user.sh"
+	versionFile     = "version.json"
 )
 
 // Agent is one agent plugin.
@@ -87,6 +96,105 @@ func (a *Agent) InstallScripts() (map[string][]byte, error) {
 		scripts[name] = data
 	}
 	return scripts, nil
+}
+
+// UpdateScripts returns the agent's optional update scripts by file name. An agent without any
+// cannot be updated in place and is left to a clean rebuild.
+func (a *Agent) UpdateScripts() (map[string][]byte, error) {
+	scripts := map[string][]byte{}
+	for _, name := range []string{updateRootFile, updateUserFile} {
+		data, err := fs.ReadFile(a.Dir, name)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("agent '%s': read %s: %w", a.Name, name, err)
+		}
+		scripts[name] = data
+	}
+	return scripts, nil
+}
+
+// VersionSpec says how to learn an agent's installed and latest version.
+type VersionSpec struct {
+	// Command prints the installed version when run inside the sandbox image; `$HOME` refers to
+	// the sandbox home, as in command.json.
+	Command []string `json:"command"`
+	// Latest is where Hole looks up the newest release, over plain HTTP from the host.
+	Latest LatestSource `json:"latest"`
+}
+
+// LatestSource is exactly one place the newest version of an agent is published.
+type LatestSource struct {
+	// NPM is a package name whose `latest` dist-tag is read from the npm registry.
+	NPM string `json:"npm,omitempty"`
+	// URL serves the version as plain text or as a `{"version": "…"}` document.
+	URL string `json:"url,omitempty"`
+}
+
+// VersionSpec reads the agent's optional version.json; an agent without one yields nil.
+func (a *Agent) VersionSpec() (*VersionSpec, error) {
+	data, err := fs.ReadFile(a.Dir, versionFile)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("agent '%s': read %s: %w", a.Name, versionFile, err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var spec VersionSpec
+	if err := decoder.Decode(&spec); err != nil {
+		return nil, fmt.Errorf("agent '%s': %s is not valid: %w", a.Name, versionFile, err)
+	}
+	if len(spec.Command) == 0 || spec.Command[0] == "" {
+		return nil, fmt.Errorf("agent '%s': %s needs a non-empty command", a.Name, versionFile)
+	}
+	if (spec.Latest.NPM == "") == (spec.Latest.URL == "") {
+		return nil, fmt.Errorf("agent '%s': %s needs exactly one latest source, npm or url", a.Name, versionFile)
+	}
+	if spec.Latest.NPM != "" && !npmPackagePattern.MatchString(spec.Latest.NPM) {
+		return nil, fmt.Errorf("agent '%s': %s latest.npm '%s' is not an npm package name",
+			a.Name, versionFile, spec.Latest.NPM)
+	}
+	if spec.Latest.URL != "" {
+		parsed, err := url.Parse(spec.Latest.URL)
+		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+			return nil, fmt.Errorf("agent '%s': %s latest.url must be an http(s) URL, got '%s'",
+				a.Name, versionFile, spec.Latest.URL)
+		}
+	}
+	return &spec, nil
+}
+
+// CheckUpdateFiles rejects a half-configured in-place update: an update script without a
+// version.json would be updated but never verified, a version.json without an update script would
+// offer updates nothing can install. An agent has both or neither.
+func (a *Agent) CheckUpdateFiles() error {
+	scripts, err := a.UpdateScripts()
+	if err != nil {
+		return err
+	}
+	spec, err := a.VersionSpec()
+	if err != nil {
+		return err
+	}
+	switch {
+	case len(scripts) > 0 && spec == nil:
+		return fmt.Errorf("agent '%s' has an update script but no %s; add %s or remove the update scripts%s",
+			a.Name, versionFile, versionFile, a.location())
+	case len(scripts) == 0 && spec != nil:
+		return fmt.Errorf("agent '%s' has a %s but no update script; add %s or remove %s%s",
+			a.Name, versionFile, updateUserFile, versionFile, a.location())
+	}
+	return nil
+}
+
+func (a *Agent) location() string {
+	if a.Path == "" {
+		return ""
+	}
+	return " (in " + a.Path + ")"
 }
 
 // Registry holds all discovered agents.
@@ -183,7 +291,23 @@ func (r *Registry) Resolve(name string) (*Agent, error) {
 
 // ResolveEnabled returns the agents whose CLIs are installed into the sandbox image. An
 // absent or empty configured list means every registered agent, matching the bash default.
+// An enabled agent with inconsistent update files is an error; a disabled one is not checked.
 func (r *Registry) ResolveEnabled(configured []string) ([]*Agent, error) {
+	enabled, err := r.ResolveEnabledUnchecked(configured)
+	if err != nil {
+		return nil, err
+	}
+	for _, agent := range enabled {
+		if err := agent.CheckUpdateFiles(); err != nil {
+			return nil, err
+		}
+	}
+	return enabled, nil
+}
+
+// ResolveEnabledUnchecked is ResolveEnabled without the update-file check, for a configuration
+// that only describes the image scope and is not itself started.
+func (r *Registry) ResolveEnabledUnchecked(configured []string) ([]*Agent, error) {
 	if len(configured) == 0 {
 		enabled := make([]*Agent, 0, len(r.byName))
 		for _, name := range r.Names() {

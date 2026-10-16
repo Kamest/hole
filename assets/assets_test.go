@@ -5,18 +5,26 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func TestEmbeddedTreeIsComplete(t *testing.T) {
 	required := []string{
 		"agents/Dockerfile",
+		"agents/Dockerfile.update",
 		"agents/entrypoint.sh",
 		"agents/claude/command.json",
 		"agents/claude/allow.txt",
+		"agents/claude/update-user.sh",
+		"agents/claude/version.json",
 		"agents/gemini/command.json",
 		"agents/gemini/allow.txt",
+		"agents/gemini/update-user.sh",
+		"agents/gemini/version.json",
 		"agents/codex/command.json",
 		"agents/codex/allow.txt",
+		"agents/codex/update-user.sh",
+		"agents/codex/version.json",
 		"gateway/Dockerfile",
 		"gateway/entrypoint.sh",
 		"gateway/hole-bridge-netfilter",
@@ -145,5 +153,38 @@ func TestGatewayEntrypointResolvesHostGatewayFromHostsFile(t *testing.T) {
 func TestSchemaIsReadable(t *testing.T) {
 	if len(Schema()) == 0 {
 		t.Error("embedded schema is empty")
+	}
+}
+
+// Update-only files are not part of the image, so changing one must not change the image tag.
+func TestBuildInputsHashIgnoresUpdateOnlyFiles(t *testing.T) {
+	base := fstest.MapFS{
+		"agents/Dockerfile":             {Data: []byte("FROM x")},
+		"agents/Dockerfile.update":      {Data: []byte("FROM y")},
+		"agents/claude/install-user.sh": {Data: []byte("install")},
+		"agents/claude/update-user.sh":  {Data: []byte("update")},
+		"agents/claude/update-root.sh":  {Data: []byte("update")},
+		"agents/claude/version.json":    {Data: []byte("{}")},
+		"gateway/version.json":          {Data: []byte("{}")},
+	}
+	reference := buildInputsHash(base)
+	changed := func(path string) fstest.MapFS {
+		fsys := fstest.MapFS{}
+		for name, file := range base {
+			fsys[name] = file
+		}
+		fsys[path] = &fstest.MapFile{Data: []byte("changed")}
+		return fsys
+	}
+	for _, path := range []string{"agents/Dockerfile.update", "agents/claude/update-user.sh",
+		"agents/claude/update-root.sh", "agents/claude/version.json"} {
+		if buildInputsHash(changed(path)) != reference {
+			t.Errorf("changing %s changed the build inputs hash", path)
+		}
+	}
+	for _, path := range []string{"agents/Dockerfile", "agents/claude/install-user.sh", "gateway/version.json"} {
+		if buildInputsHash(changed(path)) == reference {
+			t.Errorf("changing %s did not change the build inputs hash", path)
+		}
 	}
 }
