@@ -595,10 +595,10 @@ func describeChanges(before, after map[string]string) string {
 	}
 	parts := make([]string, 0, len(after))
 	for _, name := range config.SortedKeys(after) {
-		switch previous := before[name]; {
-		case previous == after[name]:
+		switch previous := before[name]; previous {
+		case after[name]:
 			parts = append(parts, fmt.Sprintf("%s %s (unchanged)", name, after[name]))
-		case previous == "":
+		case "":
 			parts = append(parts, fmt.Sprintf("%s %s", name, after[name]))
 		default:
 			parts = append(parts, fmt.Sprintf("%s %s → %s", name, previous, after[name]))
