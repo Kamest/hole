@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -459,9 +460,207 @@ func (e *Engine) ImageRemove(reference string) error {
 	return e.RunQuiet("rmi", reference)
 }
 
+// ImageUntag removes one reference even when it is the last name of an image a container still
+// uses; the image then lives on, dangling, until that container is gone. Plain `rmi` refuses that
+// case on docker. The spelling differs on purpose: docker's `rmi --force` on a tag only untags,
+// while podman's would remove the containers using the image, so podman gets its own `untag`.
+func (e *Engine) ImageUntag(reference string) error {
+	if e.IsDocker() {
+		return e.RunQuiet("rmi", "--force", reference)
+	}
+	return e.RunQuiet("untag", reference, reference)
+}
+
 // ImageTag points a second reference at an existing image.
 func (e *Engine) ImageTag(source, target string) error {
 	return e.RunQuiet("tag", source, target)
+}
+
+// ImageID returns the runtime's full identifier of a local image. Its format is runtime-specific
+// (docker prefixes the digest with `sha256:`, podman does not), so it is only ever passed back to
+// the same runtime or compared with another reading from it.
+func (e *Engine) ImageID(reference string) (string, error) {
+	out, err := e.output("image", "inspect", "--format", "{{.Id}}", reference)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// ImageSize returns the `.Size` of a local image in bytes. Its meaning depends on the image store
+// — unpacked size on overlay2 and podman, compressed content size on the containerd store — so it
+// is only ever compared with another reading from the same daemon.
+func (e *Engine) ImageSize(reference string) (int64, error) {
+	out, err := e.output("image", "inspect", "--format", "{{.Size}}", reference)
+	if err != nil {
+		return 0, err
+	}
+	size, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("unexpected image size of %s: %q", reference, strings.TrimSpace(out))
+	}
+	return size, nil
+}
+
+// ImageLabels returns the labels of a local image; an image without labels yields an empty map.
+func (e *Engine) ImageLabels(reference string) (map[string]string, error) {
+	out, err := e.output("image", "inspect", "--format", "{{json .Config.Labels}}", reference)
+	if err != nil {
+		return nil, err
+	}
+	labels := map[string]string{}
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" || trimmed == "null" {
+		return labels, nil
+	}
+	if err := json.Unmarshal([]byte(trimmed), &labels); err != nil {
+		return nil, fmt.Errorf("parse labels of %s: %w", reference, err)
+	}
+	return labels, nil
+}
+
+// ImageInfo is what one inspect of a local image reads: the fields of ImageID, ImageSize and
+// ImageLabels, all from the same resolution of the reference.
+type ImageInfo struct {
+	ID     string
+	Size   int64
+	Labels map[string]string
+}
+
+// ImageInspect reads the ID, size and labels of a local image in one runtime call. Like
+// ImageExists, a failing inspect counts as absent (found false, nil error), whatever the cause;
+// found with an error means the image exists but its output could not be parsed.
+//
+// The labels come from `{{json .Config}}`, not `{{json .Config.Labels}}`: docker's typed inspect
+// result has no `.Id`, so the CLI evaluates this format against the raw JSON, where the containerd
+// store omits an empty `Labels` key and the template fails.
+func (e *Engine) ImageInspect(reference string) (ImageInfo, bool, error) {
+	out, err := e.output("image", "inspect", "--format", "{{.Id}}\t{{.Size}}\t{{json .Config}}", reference)
+	if err != nil {
+		return ImageInfo{}, false, nil
+	}
+	info, err := parseImageInspect(out)
+	if err != nil {
+		return ImageInfo{}, true, fmt.Errorf("inspect %s: %w", reference, err)
+	}
+	return info, true, nil
+}
+
+// parseImageInspect splits the output of ImageInspect's format. JSON escapes tabs, so the config
+// cannot contain the separator.
+func parseImageInspect(out string) (ImageInfo, error) {
+	fields := strings.SplitN(strings.TrimSpace(out), "\t", 3)
+	if len(fields) != 3 {
+		return ImageInfo{}, fmt.Errorf("unexpected inspect output %q", strings.TrimSpace(out))
+	}
+	size, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return ImageInfo{}, fmt.Errorf("unexpected image size %q", fields[1])
+	}
+	var config struct {
+		Labels map[string]string
+	}
+	if err := json.Unmarshal([]byte(fields[2]), &config); err != nil {
+		return ImageInfo{}, fmt.Errorf("parse image config: %w", err)
+	}
+	if config.Labels == nil {
+		config.Labels = map[string]string{}
+	}
+	return ImageInfo{ID: fields[0], Size: size, Labels: config.Labels}, nil
+}
+
+// BuilderInfo names the buildx builder docker builds with.
+type BuilderInfo struct {
+	Name   string
+	Driver string
+}
+
+// Builder reads the current buildx builder. Only the `docker` driver builds against the daemon's
+// own image store; any other driver would try to pull a locally tagged base image.
+func (e *Engine) Builder() (BuilderInfo, error) {
+	out, err := e.output("buildx", "inspect")
+	if err != nil {
+		return BuilderInfo{}, err
+	}
+	return parseBuilder(out)
+}
+
+// parseBuilder reads the builder's own Name and Driver lines, which precede its node list.
+func parseBuilder(out string) (BuilderInfo, error) {
+	var info BuilderInfo
+	for _, line := range strings.Split(out, "\n") {
+		key, value, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		switch strings.TrimSpace(key) {
+		case "Name":
+			if info.Name == "" {
+				info.Name = value
+			}
+		case "Driver":
+			if info.Driver == "" {
+				info.Driver = value
+			}
+		}
+	}
+	if info.Driver == "" {
+		return BuilderInfo{}, fmt.Errorf("buildx inspect reported no driver")
+	}
+	return info, nil
+}
+
+// ImageBuild builds a Dockerfile from contextDir into tag, streaming the build output to the
+// console. Build args are passed in sorted order so the invocation is reproducible.
+//
+// On docker the build goes through BuildKit, which on the containerd image store would otherwise
+// attach provenance and SBOM attestations and produce a manifest list; disabling them keeps the
+// result a plain image whose ID, size and labels behave like a compose-built one. Podman does not
+// take these flags. noCache re-runs every step, for builds whose inputs do not change when the
+// outcome should (an installer fetching `@latest`).
+func (e *Engine) ImageBuild(contextDir, dockerfile, tag string, buildArgs map[string]string, noCache bool) error {
+	args := []string{"build", "-f", filepath.Join(contextDir, dockerfile), "-t", tag}
+	if noCache {
+		args = append(args, "--no-cache")
+	}
+	if e.IsDocker() {
+		args = append(args, "--provenance=false", "--sbom=false")
+	}
+	for _, key := range sortedKeys(buildArgs) {
+		args = append(args, "--build-arg", key+"="+buildArgs[key])
+	}
+	args = append(args, contextDir)
+	return e.run(args...)
+}
+
+// RunThrowaway runs a one-shot command in a new named container of image with no network and the
+// image's entrypoint replaced, and returns its stdout. The name lets garbage collection sweep a
+// container whose run was interrupted, and a timeout removes it: killing the CLI alone leaves the
+// container running. It fails when the container could not run, the command failed, or it did
+// not finish within hostHelperTimeout.
+func (e *Engine) RunThrowaway(name, image, entrypoint string, args ...string) (string, error) {
+	runArgs := []string{"run", "--rm", "--name", name, "--network", "none", "--entrypoint", entrypoint, image}
+	runArgs = append(runArgs, args...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), hostHelperTimeout)
+	defer cancel()
+	start := time.Now()
+	var stdout, stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, e.Binary, runArgs...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	logging.Debug("engine: %s run --rm --name %s --network none --entrypoint %s %s (%s)",
+		e.Binary, name, entrypoint, image, time.Since(start).Round(time.Millisecond))
+	if ctx.Err() != nil {
+		_ = e.ContainerRemove(name)
+		return stdout.String(), fmt.Errorf("%s run %s: timed out after %s", e.Binary, image, hostHelperTimeout)
+	}
+	if err != nil {
+		return stdout.String(), fmt.Errorf("%s run %s: %w: %s", e.Binary, image, err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
 }
 
 // ImagesByReference lists image references matching a reference filter.
@@ -487,8 +686,8 @@ func (e *Engine) ImagesByReference(reference string) []string {
 // matchesReference reports whether a listed image reference satisfies a `reference=` filter.
 // A pattern without a tag matches every tag, as the runtimes' own filters do.
 func matchesReference(pattern, listed string) bool {
-	patternName, patternTag := splitReference(pattern)
-	name, tag := splitReference(listed)
+	patternName, patternTag := SplitReference(pattern)
+	name, tag := SplitReference(listed)
 	if patternTag != "" && patternTag != tag {
 		return false
 	}
@@ -507,10 +706,10 @@ func matchesReference(pattern, listed string) bool {
 	}
 }
 
-// splitReference separates a reference into name and tag. The tag is the part after the last
+// SplitReference separates a reference into name and tag. The tag is the part after the last
 // colon, and only when that colon follows the last slash — otherwise the colon belongs to a
 // registry's port.
-func splitReference(reference string) (name, tag string) {
+func SplitReference(reference string) (name, tag string) {
 	if colon := strings.LastIndex(reference, ":"); colon > strings.LastIndex(reference, "/") {
 		return reference[:colon], reference[colon+1:]
 	}

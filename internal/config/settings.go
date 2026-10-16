@@ -95,6 +95,9 @@ type ContainerSettings struct {
 	Docker          bool     `json:"docker"`
 	BaseImage       string   `json:"baseImage"`
 	EnabledAgents   []string `json:"enabledAgents"`
+	// AgentUpdateCheck compares the image's agent versions with the latest releases on start
+	// and offers an in-place update. Nil means the default, on.
+	AgentUpdateCheck *bool `json:"agentUpdateCheck"`
 }
 
 // HookSettings holds the lifecycle hook scripts. Every entry may be a literal path or a

@@ -17,6 +17,9 @@ assets/agents/<name>/      (builtin, embedded)
   allow.txt          # required — domains the agent CLI needs at runtime
   install-root.sh    # optional — runs as root during the image build (system packages)
   install-user.sh    # optional — runs as the sandbox user during the build (the CLI itself)
+  update-root.sh     # optional — runs as root during an in-place update (rare)
+  update-user.sh     # optional — runs as the sandbox user during an in-place update
+  version.json       # optional — how Hole reads the installed and the latest version
 ```
 
 - `command.json` is emitted as the compose `command`. Entries may reference `$HOME`, which Hole
@@ -37,14 +40,144 @@ assets/agents/<name>/      (builtin, embedded)
   users add those through `network.allow`.
 - `install-user.sh` typically also pre-seeds config so the user is not re-prompted in every
   sandbox — claude writes `~/.claude.json` with the onboarding and trust flags accepted.
+- Every install and update script cleans its package manager's cache in the same script — npm's
+  alone was ~300 MB of the image, and a cache written in one layer is never reclaimed by a later
+  one.
+- `update-*.sh` and `version.json` opt the agent into [in-place updates](#in-place-agent-updates);
+  an agent has both or neither.
 
-> **The Node version is pinned in two files that must agree.** gemini and codex name the
-> interpreter by absolute path (`$HOME/.nvm/versions/node/v<x.y.z>/bin/node`) because the agent is
-> `exec`'d without nvm's shell initialisation, so `install-user.sh` must run `nvm install <x.y.z>`
+> **The Node version is pinned in the files that name the interpreter, and they must agree.**
+> gemini and codex name the interpreter by absolute path
+> (`$HOME/.nvm/versions/node/v<x.y.z>/bin/node`) because the agent is `exec`'d without nvm's shell
+> initialisation, so `install-user.sh` must run `nvm install <x.y.z>`
 > for exactly that version. A floating `nvm install 22` drifts to a newer patch at build time and
-> the agent then fails to launch with ENOENT — invisible until someone starts it. Changing the
-> version means editing both files; `TestPinnedNodeVersionMatchesTheInstallScript` fails if they
-> disagree.
+> the agent then fails to launch with ENOENT — invisible until someone starts it. `version.json`
+> runs the CLI the same way and carries the same path. Changing the version means editing
+> `install-user.sh`, `command.json`, `version.json` and `update-user.sh`;
+> `TestPinnedNodeVersionMatchesTheInstallScript` fails if they disagree. Update scripts never
+> install another Node and do not load nvm: they run the pinned Node's npm by absolute path (and
+> prepend its `bin` to `PATH` for that process only). nvm's default can be a different Node — a
+> setup hook that installs one makes it the default — and its npm would update a CLI the agent never
+> runs; the update is then a no-op and is offered on every start. Neither `nvm use` nor
+> `nvm alias` is used, so the user's default stays whatever the setup hooks made it.
+
+## In-place agent updates
+
+`hole start --update-agents`, or a `Y` at the start's version prompt, updates agent CLIs inside the
+existing image instead of rebuilding it. `-r` re-runs everything after `CACHEBUST` — apt,
+`dependencies`, every installer and all `hooks.setup` scripts — which is slow and fails for reasons
+unrelated to the agents.
+
+**Agent set.** Only enabled agents are ever checked or updated: the image contains exactly
+`container.enabledAgents`, so the set is the same list the build context uses.
+`--update-agents` takes every enabled agent with an update script (and warns about the others); a
+`Y` takes only the agents the prompt listed, so one agent's update adds no layer for the others.
+
+**Plugin files.**
+
+- `update-root.sh` / `update-user.sh` update the CLI with its own mechanism. Builtins: `claude
+  update`, and `npm install -g <package>@latest && npm cache clean --force` for codex and gemini. An
+  agent without either is skipped by `--update-agents` with a warning — the right behaviour for a user agent that pins
+  its version in `install-user.sh`. Update scripts must not change Node, must clean their cache,
+  and must leave configuration alone (pre-seeded `~/.claude.json`, whatever setup hooks did).
+- `version.json`:
+
+  ```json
+  {
+    "command": ["$HOME/.local/bin/claude", "--version"],
+    "latest": { "url": "https://downloads.claude.ai/claude-code-releases/latest" }
+  }
+  ```
+
+  `command` runs inside a container of the image, with `$HOME` expanded like `command.json`; it is a
+  separate command because `command.json` carries flags (`--dangerously-skip-permissions`,
+  `--yolo`) whose interplay with `--version` is not guaranteed. The installed version is the first
+  `x.y.z` in its output. `latest` is exactly one of `{"npm": "<package>"}` (the package's `latest`
+  dist-tag from `registry.npmjs.org`) or `{"url": "<http(s) URL>"}` (plain text or
+  `{"version": "…"}`); a response that does not look like a version is discarded, so an HTML error
+  page never becomes "latest". Claude's URL is what its own installer reads, so the check follows the
+  same `latest` channel the image was built from.
+- **Both or neither** (`Agent.CheckUpdateFiles`, enforced by `Registry.ResolveEnabled` for enabled
+  agents only): an update script without `version.json` would be updated but never verified — and
+  could not tell the no-op detection that it changed — while a `version.json` without an update
+  script would offer an update that nothing can install. Either, or a malformed `version.json`,
+  fails the start with an error naming the agent and the file; the registry load itself does not
+  fail, so a broken agent that is not enabled stays harmless.
+
+**Update build.** `assets/agents/Dockerfile.update` is built directly (`engine.ImageBuild`, not
+compose) from a context in the run directory holding only the selected agents' update scripts:
+
+1. The current image is inspected once more (`engine.ImageInspect`: ID, size and labels in one
+   call, so the labels belong to exactly that ID) and its ID is tagged
+   `hole-sandbox/agent-update:<instanceID>-base`, which becomes `FROM`. The start's own read is not
+   reused here: the update prompt can block for minutes while a sibling start retags the reference.
+   Tagging the ID pins exactly the image whose labels were read, and BuildKit does not accept an ID
+   in `FROM` (it expands `sha256:…` to `docker.io/library/sha256:…` and tries to pull).
+2. One `RUN` executes every `update-root.sh` with `HOME=/root` (the image's `ENV HOME` is the
+   sandbox home, unlike during `install-root.sh`), then every `update-user.sh` through `runuser`
+   with the sandbox user's `HOME`, `BASH_ENV` and `PATH`. With the `COPY` that is two layers per
+   update; the base image has ~19 and overlay2 caps at ~127.
+3. Labels `com.hole.clean-size` and `com.hole.agent-updates` are set, and `USER ${AGENT_USERNAME}`
+   is the last instruction — without it every container of the updated image would run as root.
+   `ENV`, `ENTRYPOINT` and `com.hole.image` are inherited.
+4. The build always runs with `--no-cache`: after a no-op or a rejected update the base and the
+   scripts are unchanged, and a cache hit would replay the old result instead of fetching a newer
+   release. On docker it also passes `--provenance=false --sbom=false`, so the containerd image store
+   produces a plain image rather than a manifest list with attestations.
+
+The result is tagged `hole-sandbox/agent-update:<instanceID>` — a repository of its own, because
+the image GC of a concurrent start removes every other tag of the agent repositories. Docker needs
+a buildx builder with the `docker` driver, the only one that sees the daemon's image store; the
+engine reads the current builder's driver (`docker buildx inspect`) and otherwise skips the update
+with a warning naming the builder. It never switches builders: on a non-default context the
+docker-driver builder is named after the context (`colima`), and other builders can be in an error
+state. Podman's buildah always sees local storage.
+
+**Validate, then retag.** Before the build the current image's versions are known (cache by image
+ID, else one throwaway run of that ID — not of the reference, which a concurrent update or `-r` of
+another start may retag meanwhile). After it, the `version.json` commands of **all** enabled agents run in
+one throwaway container (`--network none`, entrypoint `bash`, one marker line per agent). Any agent
+with a `version.json` that prints no version rejects the update — this catches an npm install of a
+CLI that needs a newer Node, which npm only warns about. All versions identical to before is a
+no-op: nothing is retagged and nothing counted (a filesystem diff cannot tell, since updaters write
+logs and state even when nothing changed). Otherwise the real reference is retagged and the
+validated versions are cached under the new image ID. The old image becomes dangling; a sandbox
+still running it is unaffected, and the labelled dangling prune collects it once unused. The base
+tag may be that image's last name while a sibling sandbox runs it, which plain `rmi` refuses, so
+the temporary references are dropped with `engine.ImageUntag` (`rmi --force` on docker, which only
+untags; `podman untag`, because podman's `rmi --force` would remove the containers). Every failure
+is a warning and the start continues with the old image; a signal during the build ends the start.
+
+**Growth guard.** Lower layers keep every old CLI, so each update grows the image (+22.7 % measured
+for claude and codex together before the npm cache cleanup). Before an update, `.Size` divided by
+`com.hole.clean-size` ≥ 2, or `com.hole.agent-updates` ≥ 40 (layer backstop), asks for a clean
+rebuild; `Y` is exactly the `-r` path, never automatic, because `-r` re-runs hooks and needs the
+network for every installer. `.Size` is only compared with itself: it is the unpacked size on
+overlay2 and podman, the compressed content size on the containerd store. A clean build has neither
+label, so the baseline resets on its own; adoption retags keep them. A no-op or rejected update removes its
+image but its layers stay in the builder cache until `docker builder prune` — accepted, since such
+updates are rare.
+
+**Version check on start** (`internal/agentversion`). Runs when the image exists, without `-r` or
+`--update-agents`, with `container.agentUpdateCheck` not `false`, and only for enabled agents with a
+`version.json`. The start inspects the agent image once (after adoption, skipped on `-r`) and hands
+that read to both the banner and the check, so a start without an update costs one `image inspect`. Installed versions come from `~/.hole/agent-versions.json`, keyed by image ID (a
+miss costs one throwaway container, ~1–2 s once per image). A probe in which any agent prints no
+version is warned about and not cached — a cached gap would hide that agent's updates for the
+image's lifetime — so a permanently broken version command costs that container on every start
+until it is fixed. Latest versions are fetched **on the
+host with `net/http` only** — the host has no npm, node or curl, and no agent-provided program may
+ever run on it — in parallel, each agent's fetch with its own 1 s timeout, at most once per 4 h per agent after a
+successful fetch. A failed fetch is not recorded, so it is retried on the next start — an offline
+host pays up to 1 s per start — while the last successful version stays known and keeps being
+offered. Every checked agent has an update
+script too (both or neither), so every newer version can be offered. `s` records the offered version as `skipped`; an agent is offered
+again only when `GreaterThan(latest, skipped)` — not inequality, so a rolled-back dist-tag does not
+re-offer an older release — and an update installing the skipped or a newer version clears it. The
+state file is written through a unique temporary file and a rename, because concurrent starts share
+it; entries of images that no longer exist are dropped on every write. A state unchanged since it
+was loaded is neither pruned nor written — pruning costs one `image inspect` per cached image — so
+most starts leave the file alone and stale entries wait for the next real change.
 
 ## Registry rules
 

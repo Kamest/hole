@@ -632,6 +632,24 @@ func TestDinDSidecarMountsLibraryBeforeItsExclusions(t *testing.T) {
 	}
 }
 
+// HOLE_PROJECT_SETTINGS_FILE replaces only the main project's settings: a library keeps hiding what
+// its own .hole/settings.json asks to hide.
+func TestLibraryKeepsItsOwnExclusionsUnderAProjectSettingsOverride(t *testing.T) {
+	projectDir, libraryDir := fixture(t)
+	writeSettingsFile(t, filepath.Join(libraryDir, ".hole", "settings.json"), `{"files":{"exclude":[".env"]}}`)
+	override := filepath.Join(t.TempDir(), "wrapper-project.json")
+	writeSettingsFile(t, override, `{}`)
+	settings := &config.Settings{}
+	settings.Libraries = map[string]config.Library{libraryDir: {Path: "/libs/shared"}}
+
+	in := testInput(t, projectDir, t.TempDir(), settings, Options{})
+	in.host.ProjectSettingsFile = override
+
+	if agent := agentServiceBlock(t, in); !strings.Contains(agent, "/dev/null:/libs/shared/.env:ro") {
+		t.Errorf("the library's own exclusion is lost under HOLE_PROJECT_SETTINGS_FILE:\n%s", agent)
+	}
+}
+
 // A library without a settings file of its own is still covered by the global `files.exclude`,
 // end to end: the over-mount must reach the agent and be mirrored onto the sidecar after the
 // library bind, or `docker build` in the sandbox reads the file the agent cannot.

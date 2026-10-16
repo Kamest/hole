@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -406,5 +407,135 @@ func TestAttachWithoutATerminal(t *testing.T) {
 				t.Errorf("Attach exit code = %d, want 7 (the container's own)", exitErr.ExitCode())
 			}
 		})
+	}
+}
+
+// The agent update build starts FROM a tag Hole put on a local image. That only works when the
+// builder sees the daemon's own image store, and the result has to be a plain image whose ID,
+// size and labels read back the way a compose-built one does.
+func TestImageBuildFromALocalTag(t *testing.T) {
+	engine := testEngine(t)
+	if engine.IsDocker() {
+		builder, err := engine.Builder()
+		if err != nil {
+			t.Skipf("no buildx builder: %v", err)
+		}
+		if builder.Driver != "docker" {
+			t.Skipf("builder %s uses the %s driver, which cannot see local images", builder.Name, builder.Driver)
+		}
+	}
+	if err := engine.RunQuiet("pull", "alpine:3.19"); err != nil {
+		t.Skipf("could not pull the stand-in image: %v", err)
+	}
+	base := "hole-sandbox/" + testLabelValue + "-build:base"
+	target := "hole-sandbox/" + testLabelValue + "-build:built"
+	if err := engine.ImageTag("alpine:3.19", base); err != nil {
+		t.Fatalf("ImageTag: %v", err)
+	}
+	t.Cleanup(func() { _ = engine.ImageRemove(target); _ = engine.ImageRemove(base) })
+
+	contextDir := t.TempDir()
+	dockerfile := "ARG BASE\nFROM ${BASE}\nARG MARKER\nRUN echo \"${MARKER}\" > /marker\nLABEL com.hole.test=\"${MARKER}\"\n"
+	if err := os.WriteFile(contextDir+"/Dockerfile.test", []byte(dockerfile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.ImageBuild(contextDir, "Dockerfile.test", target,
+		map[string]string{"BASE": base, "MARKER": "built-from-base"}, false); err != nil {
+		t.Fatalf("ImageBuild: %v", err)
+	}
+
+	labels, err := engine.ImageLabels(target)
+	if err != nil {
+		t.Fatalf("ImageLabels: %v", err)
+	}
+	if labels["com.hole.test"] != "built-from-base" {
+		t.Errorf("labels = %v, want com.hole.test=built-from-base", labels)
+	}
+	if baseLabels, err := engine.ImageLabels(base); err != nil || len(baseLabels) != 0 {
+		t.Errorf("labels of an unlabelled image = %v, %v; want an empty map", baseLabels, err)
+	}
+
+	builtID, err := engine.ImageID(target)
+	if err != nil || builtID == "" {
+		t.Fatalf("ImageID = %q, %v", builtID, err)
+	}
+	baseID, _ := engine.ImageID(base)
+	if builtID == baseID {
+		t.Error("the build produced the base image itself")
+	}
+	builtSize, err := engine.ImageSize(target)
+	if err != nil || builtSize <= 0 {
+		t.Fatalf("ImageSize = %d, %v", builtSize, err)
+	}
+
+	info, found, err := engine.ImageInspect(target)
+	if !found || err != nil {
+		t.Fatalf("ImageInspect = %v, %v", found, err)
+	}
+	if info.ID != builtID || info.Size != builtSize || !reflect.DeepEqual(info.Labels, labels) {
+		t.Errorf("ImageInspect = %+v, want the separate reads %s, %d, %v", info, builtID, builtSize, labels)
+	}
+	if baseInfo, found, err := engine.ImageInspect(base); !found || err != nil || len(baseInfo.Labels) != 0 || baseInfo.ID != baseID {
+		t.Errorf("ImageInspect(base) = %+v, %v, %v; want ID %s and no labels", baseInfo, found, err, baseID)
+	}
+	if _, found, err := engine.ImageInspect("hole-sandbox/" + testLabelValue + "-build:absent"); found || err != nil {
+		t.Errorf("ImageInspect of a missing image = %v, %v; want not found", found, err)
+	}
+
+	throwaway := testLabelValue + "-throwaway"
+	_ = engine.ContainerRemove(throwaway)
+	t.Cleanup(func() { _ = engine.ContainerRemove(throwaway) })
+	out, err := engine.RunThrowaway(throwaway, target, "sh", "-c", "cat /marker; ls /sys/class/net")
+	if err != nil {
+		t.Fatalf("RunThrowaway: %v", err)
+	}
+	if !strings.Contains(out, "built-from-base") {
+		t.Errorf("RunThrowaway output = %q, want the marker", out)
+	}
+	// --network none leaves the loopback interface only.
+	if strings.Contains(out, "eth0") {
+		t.Errorf("throwaway container has a network interface: %q", out)
+	}
+	if _, err := engine.RunThrowaway(throwaway, target, "sh", "-c", "exit 3"); err == nil {
+		t.Error("RunThrowaway reported success for a failing command")
+	}
+}
+
+// After an agent update the old image keeps only Hole's temporary base tag, while a sibling
+// sandbox may still run it. Removing that tag must not fail, and must not touch the container.
+func TestImageUntagWhileAContainerUsesTheImage(t *testing.T) {
+	engine := testEngine(t)
+	if err := engine.RunQuiet("pull", "alpine:3.19"); err != nil {
+		t.Skipf("could not pull the stand-in image: %v", err)
+	}
+	reference := "hole-sandbox/" + testLabelValue + "-untag:only"
+	container := testLabelValue + "-untag"
+	contextDir := t.TempDir()
+	// A fresh image, so the reference is its only name.
+	if err := os.WriteFile(contextDir+"/Dockerfile", []byte("FROM alpine:3.19\nRUN echo untag > /marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.ImageBuild(contextDir, "Dockerfile", reference, nil, false); err != nil {
+		t.Fatalf("ImageBuild: %v", err)
+	}
+	id, _ := engine.ImageID(reference)
+	_ = engine.ContainerRemove(container)
+	t.Cleanup(func() {
+		_ = engine.ContainerRemove(container)
+		_ = engine.ImageRemove(reference)
+		_ = engine.ImageRemove(id)
+	})
+	if err := engine.RunQuiet("run", "-d", "--name", container, reference, "sleep", "60"); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if err := engine.ImageUntag(reference); err != nil {
+		t.Fatalf("ImageUntag: %v", err)
+	}
+	if engine.ImageExists(reference) {
+		t.Error("the reference still exists")
+	}
+	if !engine.ContainerRunning(container) {
+		t.Error("untagging stopped the container using the image")
 	}
 }

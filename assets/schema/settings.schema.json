@@ -155,6 +155,10 @@
                 "pattern": "^[a-z0-9][a-z0-9-]*$"
               },
               "uniqueItems": true
+            },
+            "agentUpdateCheck": {
+              "type": "boolean",
+              "description": "On start, compare the agent CLI versions in the sandbox image with their latest releases and offer an in-place update (default true)"
             }
           }
         },

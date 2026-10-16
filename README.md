@@ -21,6 +21,7 @@ Table of contents:
 - [What is Hole?](#what-is-hole)
 - [Usage](#usage)
   - [Flags](#flags)
+  - [Updating agents](#updating-agents)
   - [Passing arguments to the agent](#passing-arguments-to-the-agent)
   - [Other commands](#other-commands)
 - [Installation](#installation)
@@ -78,14 +79,79 @@ Run without a terminal — from a script, a CI job, or with the output piped —
 | `-d`, `--debug` | Open a bash shell instead of the agent CLI, for inspecting the sandbox |
 | `-n`, `--dump-network-access` | After the agent exits, write the domains the sandbox resolved (and those it was refused) to `~/.hole/logs/{project}/network-access-{agent}-{id}.log` |
 | `-r`, `--rebuild` | Force a rebuild of the sandbox images |
+| `--update-agents` | Update the enabled agent CLIs inside the existing image before starting, without a full rebuild; see [updating agents](#updating-agents) |
 | `-u`, `--unrestricted-network` | Disable egress filtering; allow all network access |
 | `--with-docker` | Enable the Docker-in-Docker sidecar |
-| `--trust-project` | Accept whatever the project's own `.hole/settings.json` asks for beyond the sandbox — host access and network widening alike — without being asked, and remember it; see [project trust](#project-trust) |
+| `--trust-project` | Accept whatever the project's own settings ask for beyond the sandbox — host access and network widening alike — without being asked, and remember it; see [project trust](#project-trust) |
 | `--library PATH[:MOUNT][:rw]` | Mount an extra directory (repeatable); mounted at its own host path unless `MOUNT` is given, read-only unless `:rw` |
 | `--` | Everything after this is passed verbatim to the agent CLI |
 
 `-r` is only needed to refresh *versions* (latest apt packages, latest agent CLIs). Changing a
-setting that affects the image produces a new image automatically.
+setting that affects the image produces a new image automatically. For newer agent CLIs alone,
+`--update-agents` is faster and does not re-run your setup hooks.
+
+### Updating agents
+
+Agent CLIs release often, and the sandbox image keeps the versions it was built with. Instead of a
+full `-r` rebuild — which re-runs apt, every installer and all `hooks.setup` scripts — Hole can
+update the agents inside the existing image:
+
+```sh
+hole start claude . --update-agents     # update all enabled agents in the image, then start
+```
+
+This runs each enabled agent's own update mechanism (`claude update`, `npm install -g …@latest`)
+in a thin layer on top of the current image, checks that every agent still reports a version, and
+only then switches the image over. If anything fails, the start continues with the old image and a
+warning. An update that changes no version is discarded.
+
+**Version check on start.** When the image already exists, Hole compares the installed agent
+versions with the latest releases (fetched over HTTPS from the host — the npm registry and
+Claude's download server — at most every 4 hours, with a 1-second limit so a slow network never
+holds up a start) and asks:
+
+```
+Agent updates available: claude 2.1.282 → 2.1.296, codex 0.160.0 → 0.162.1
+Update agents now? [Y/n/s = skip these versions]
+```
+
+- `Y` (or Enter) updates only the listed agents, then starts;
+- `n` starts unchanged and asks again next time;
+- `s` skips these versions: they are not offered again until an even newer release appears.
+
+Without a terminal there is no prompt, only an info line naming `--update-agents`. Turn the check
+off with [`container.agentUpdateCheck: false`](#container-settings). It is skipped with `-r` and
+`--update-agents`, and on a start that builds the image anyway.
+
+**Image growth.** Every update keeps the previous CLI in a lower image layer, so the image grows.
+The start banner shows the history once there is one:
+
+```
+Agent image: hole-sandbox/agent-global:a28c47c6117e (shared) — 3 agent updates since clean build (1.92 GB → 2.81 GB, 1.46×)
+```
+
+Once the image reaches twice its clean size (or 40 updates), an update first offers a clean rebuild:
+
+```
+Agent image grew from 1.92 GB to 3.9 GB (2.0×) over 5 agent updates since the last clean build.
+Rebuild cleanly now (also re-runs setup hooks)? [Y/n]
+```
+
+`Y` is the same as `-r`; `n` updates in place again. Without a terminal it warns and updates in
+place. A clean rebuild — `-r`, or any settings change that produces a new image — resets the
+history.
+
+Things to know:
+
+- Updates are not sticky across settings changes: a change that produces a new image tag builds it
+  from the cache, with the CLI versions of the original build. Run `--update-agents` again.
+- An update overrides a CLI version a setup hook pinned. Pin it in a custom agent instead, without
+  an update script.
+- The shared image is updated once for every project using it; a project-specific image is
+  updated per project.
+- With docker, the update needs a buildx builder using the `docker` driver (the default one) so
+  the build can start from a local image; with another active builder the update is skipped with a
+  warning naming it.
 
 ### Passing arguments to the agent
 
@@ -109,7 +175,7 @@ hole uninstall                 # remove Hole's Docker resources and the binary
 hole help                      # usage
 ```
 
-`hole list` shows the instance ID, agent (and profile), project path, uptime, whether Docker-in-Docker is enabled, the sandbox network, and which settings files were merged — the global one by path, e.g. `global(~/.hole/settings.json)+project`, so a sandbox started with [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file) shows which file it runs with.
+`hole list` shows the instance ID, agent (and profile), project path, uptime, whether Docker-in-Docker is enabled, the sandbox network, and which settings files were merged — the global one by path, e.g. `global(~/.hole/settings.json)+project`, so a sandbox started with [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file) shows which file it runs with. A [`HOLE_PROJECT_SETTINGS_FILE`](#alternative-project-settings-file) override is named by path too, e.g. `project(/path/to/project-settings.json)`; the in-repo file stays plain `project`.
 
 ## Installation
 
@@ -346,6 +412,9 @@ Any directory under `~/.hole/agents/<name>/` becomes an agent you can start:
   allow.txt          # required — domains the agent needs (see below)
   install-root.sh    # optional — runs as root during the image build
   install-user.sh    # optional — runs as the sandbox user during the image build
+  update-root.sh     # optional — runs as root during an in-place update
+  update-user.sh     # optional — runs as the sandbox user during an in-place update
+  version.json       # optional — how to read the installed and the latest version
 ```
 
 ```json
@@ -359,14 +428,36 @@ api.my-agent.example
 *.my-agent.example
 ```
 
-Names must match `^[a-z0-9][a-z0-9-]*$`, and a name that collides with a builtin agent is an error rather than a silent override. Custom agents work everywhere builtins do, including `container.enabledAgents`. Editing a custom agent's files rebuilds the image automatically.
+Names must match `^[a-z0-9][a-z0-9-]*$`, and a name that collides with a builtin agent is an error rather than a silent override. Custom agents work everywhere builtins do, including `container.enabledAgents`. Editing a custom agent's files rebuilds the image automatically — except its update files (`update-*.sh`, `version.json`), which are not part of the image.
+
+To take part in [agent updates](#updating-agents), add an update script and a `version.json`:
+
+```json
+// version.json
+{
+  "command": ["$HOME/.local/bin/my-agent", "--version"],
+  "latest": { "npm": "@my-org/my-agent" }
+}
+```
+
+`command` runs inside the sandbox image (`$HOME` is the sandbox home) and must print a version
+`x.y.z`; `latest` is either `{"npm": "<package>"}` or `{"url": "<https URL>"}` serving the version as
+plain text or as `{"version": "…"}`. An agent has both an update script and `version.json`, or
+neither — leave both out to keep a pinned version (the agent is then refreshed only by `-r`). An
+enabled agent with just one of them, or with a malformed `version.json`, stops the start with an
+error naming the file to fix. An
+update script must not change the Node version the agent's command names, must clean its package
+manager's cache, and must leave the agent's configuration alone. If the agent runs on an
+nvm-installed Node, the script must run that Node's npm by absolute path (e.g.
+`$HOME/.nvm/versions/node/v22.22.2/bin/npm`): a setup hook may have made another Node nvm's default,
+and its npm would update a CLI the agent never runs.
 
 ## Configuration
 
 Two optional files, sharing one schema:
 
 - `~/.hole/settings.json` — global defaults (or the file named by [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file))
-- `<project>/.hole/settings.json` — per-project settings
+- `<project>/.hole/settings.json` — per-project settings (or the file named by [`HOLE_PROJECT_SETTINGS_FILE`](#alternative-project-settings-file))
 
 They are merged: objects deep-merge with the project winning, arrays concatenate (global first) and deduplicate, and scalars are overridden by the project.
 
@@ -393,6 +484,22 @@ HOLE_SETTINGS_FILE=/path/to/generated-settings.json hole start claude .
 - It must be an absolute path to an existing file; anything else stops the start instead of silently falling back to the default settings.
 - It must not lie inside the project or inside any included, library or worktree path: the global file is trusted without a prompt, so an agent that could edit it could add a `hooks.setupHost` that runs on your host at the next start. Hole refuses to start in that case (symlinks are followed).
 - Relative paths inside it (hook scripts, for example) resolve against the **project**, like in any settings file — a wrapper shipping scripts beside the file should reference them by absolute path.
+
+### Alternative project settings file
+
+A wrapper can likewise replace the project's own settings document:
+
+```sh
+HOLE_PROJECT_SETTINGS_FILE=/path/to/project-settings.json hole start claude .
+```
+
+- The file **replaces** `<project>/.hole/settings.json` for that run — the two are not merged, and the in-repo file is ignored completely (Hole says so when it exists). The global settings (`~/.hole/settings.json` or [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file)) are merged underneath as usual, and profiles resolve across both.
+- **The in-repo `files.exclude` no longer applies.** Secrets the repository asks to hide stay visible to the agent unless the override or the global settings exclude them too.
+- Only the main project is affected. Libraries, derived worktrees and worktree-pool checkouts keep reading their own `.hole/settings.json`.
+- It is still subject to [project trust](#project-trust), exactly like the in-repo file: a wrapper that must not prompt passes `--trust-project`, and an override asking for a different set of grants asks again.
+- It must be an absolute path to an existing file; anything else stops the start instead of silently falling back to the in-repo file.
+- Relative paths inside it resolve against the **project**, like in any settings file.
+- A wrapper that passes `--trust-project` on every run must not keep the file inside a path mounted into any sandbox: an agent could plant grants there that the next start accepts without asking, and unlike the in-repo file the override is not under the repository's review.
 
 ### Project trust
 
@@ -740,7 +847,8 @@ Installed during the image build, which uses your host's network, so the Ubuntu 
     "memorySwapLimit": "8g",
     "baseImage": "ubuntu:24.04",
     "docker": true,
-    "enabledAgents": ["claude", "codex"]
+    "enabledAgents": ["claude", "codex"],
+    "agentUpdateCheck": true
   }
 }
 ```
@@ -749,6 +857,7 @@ Installed during the image build, which uses your host's network, so the Ubuntu 
 - `baseImage` — must stay Ubuntu 24.04-based (the image build uses apt)
 - `docker` — enable the [Docker-in-Docker](#docker-in-docker) sidecar
 - `enabledAgents` — which agents get installed into the image (default: all registered agents, including your custom ones). The agent you start must be in this list.
+- `agentUpdateCheck` — compare the image's agent versions with the latest releases on start and offer an [in-place update](#updating-agents) (default `true`)
 
 The container user mirrors your host user — same username and home path — so agent config paths look identical inside and outside the sandbox. The user has passwordless `sudo`; the container is the boundary, not the user.
 

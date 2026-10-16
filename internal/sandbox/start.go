@@ -50,6 +50,9 @@ type Options struct {
 	// TrustProject accepts the project settings' host-affecting keys without asking, for
 	// runs with no terminal to prompt on.
 	TrustProject bool
+	// UpdateAgents updates every enabled agent that has an update script inside the existing
+	// image before the start, without a full rebuild.
+	UpdateAgents bool
 	// Libraries are raw --library values: PATH[:MOUNT][:rw].
 	Libraries []string
 	AgentArgs []string
@@ -153,7 +156,7 @@ func Start(opts Options) (exitCode int, err error) {
 	// declines the project's grants must not have recorded one.
 	if err := trust.Gate(trust.Options{
 		ProjectDir:   opts.ProjectDir,
-		SettingsFile: projectSettingsFile(opts.ProjectDir),
+		SettingsFile: host.ProjectSettingsPath(opts.ProjectDir),
 		Document:     documents.project,
 		Store:        trust.NewStore(host.HoleDir()),
 		Interactive:  engine.IsTerminal(os.Stdin),
@@ -192,6 +195,9 @@ func Start(opts Options) (exitCode int, err error) {
 	if snapshot, err := json.Marshal(documents.merged); err == nil {
 		instance.Settings = snapshot
 		instance.SettingsFiles = documents.files
+		if host.ProjectSettingsPath(opts.ProjectDir) != projectSettingsFile(opts.ProjectDir) {
+			instance.ProjectSettingsFile = host.ProjectSettingsFile
+		}
 		if err := store.Write(instance); err != nil {
 			logging.Warn("could not update the instance registry: %v", err)
 		}
@@ -215,6 +221,13 @@ func Start(opts Options) (exitCode int, err error) {
 	gatewayImage := image.GatewayImage(assets.BuildInputsHash())
 	instance.GatewayImage = gatewayImage
 
+	// A sibling workspace of the same project holds a bit-identical image under its own path-keyed
+	// repository, and re-tagging it turns the build into a no-op. Before the agent version check,
+	// so an adopted image counts as existing.
+	if !opts.Rebuild {
+		adoptExistingImage(containerEngine, imageIdentity)
+	}
+
 	if opts.Debug {
 		logging.Warn("Debug mode: opening bash shell instead of agent CLI")
 		logging.Line()
@@ -225,8 +238,49 @@ func Start(opts Options) (exitCode int, err error) {
 	if opts.Profile != "" {
 		logging.Info("Profile: %s", opts.Profile)
 	}
-	logging.Info("Agent image: %s", imageIdentity.Describe())
+	var agentImage engine.ImageInfo
+	agentImageFound := false
+	if !opts.Rebuild {
+		var err error
+		agentImage, agentImageFound, err = containerEngine.ImageInspect(imageIdentity.Reference())
+		if err != nil {
+			logging.Warn("could not read the agent image: %v", err)
+			agentImageFound = false
+		}
+	}
+	logging.Info("Agent image: %s", describeAgentImage(imageIdentity, agentImage, agentImageFound))
 	logging.Line()
+
+	updater := &agentUpdater{
+		engine:       containerEngine,
+		host:         host,
+		reference:    imageIdentity.Reference(),
+		runTmpDir:    runTmpDir,
+		instanceID:   instanceID,
+		instanceName: instanceName,
+		enabled:      enabledAgents,
+		interactive:  engine.IsTerminal(os.Stdin),
+		in:           os.Stdin,
+		out:          os.Stderr,
+		statePath:    host.AgentVersionsFile(),
+		interrupted:  func() bool { return signalled.Load() != 0 },
+		image:        agentImage,
+		imageFound:   agentImageFound,
+	}
+	cleanRebuild := updater.prepare(opts.Rebuild, opts.UpdateAgents, agentUpdateCheckEnabled(settings))
+	// An interrupted update build only warns — it must not fail the start — so the signal is the
+	// one thing that says the user wanted out.
+	if signalled.Load() != 0 {
+		return 1, fmt.Errorf("interrupted during the agent update")
+	}
+	if cleanRebuild {
+		// The growth guard's answer: the same path as -r.
+		opts.Rebuild = true
+		instance.Flags.Rebuild = true
+		if err := store.Write(instance); err != nil {
+			logging.Warn("could not update the instance registry: %v", err)
+		}
+	}
 
 	if opts.Rebuild {
 		removeForRebuild(containerEngine, imageIdentity.Reference(), gatewayImage)
@@ -403,12 +457,6 @@ func Start(opts Options) (exitCode int, err error) {
 		}
 	}
 
-	// Before compose looks: a sibling workspace of the same project holds a bit-identical image
-	// under its own path-keyed repository, and re-tagging it here turns the build into a no-op.
-	if !opts.Rebuild {
-		adoptExistingImage(containerEngine, imageIdentity)
-	}
-
 	logging.Info("Starting %s agent...", opts.Agent)
 	logging.Line()
 	if err := containerEngine.ComposeUp(instanceName, composeFile, runTmpDir, opts.Rebuild, "agent"); err != nil {
@@ -510,7 +558,8 @@ func attach(containerEngine *engine.Engine, container string) int {
 	return 1
 }
 
-// projectSettingsFile is the per-project settings path.
+// projectSettingsFile is the in-repo project settings path, which HOLE_PROJECT_SETTINGS_FILE
+// may replace for the main project (see hostenv.Host.ProjectSettingsPath).
 func projectSettingsFile(projectDir string) string {
 	return filepath.Join(projectDir, ".hole", "settings.json")
 }
@@ -535,13 +584,22 @@ type settingsDocuments struct {
 // project profile can extend a globally-defined one and vice versa.
 func loadSettingsDocument(host hostenv.Host, projectDir, profile string) (settingsDocuments, error) {
 	globalPath := host.GlobalSettingsFile()
-	projectPath := projectSettingsFile(projectDir)
+	projectPath := host.ProjectSettingsPath(projectDir)
+	projectLabel := "project settings (.hole/settings.json)"
+	// The override replaces the in-repo file entirely, its files.exclude included, so a human
+	// running the command by hand must see that the repository's own file was skipped.
+	if inRepo := projectSettingsFile(projectDir); projectPath != inRepo {
+		projectLabel = fmt.Sprintf("project settings (HOLE_PROJECT_SETTINGS_FILE %s)", projectPath)
+		if _, err := os.Stat(inRepo); err == nil {
+			logging.Info("ignoring %s: project settings come from HOLE_PROJECT_SETTINGS_FILE (%s)", inRepo, projectPath)
+		}
+	}
 
 	globalDoc, err := config.LoadAndValidate(globalPath, fmt.Sprintf("global settings (%s)", globalPath))
 	if err != nil {
 		return settingsDocuments{}, err
 	}
-	projectDoc, err := config.LoadAndValidate(projectPath, "project settings (.hole/settings.json)")
+	projectDoc, err := config.LoadAndValidate(projectPath, projectLabel)
 	if err != nil {
 		return settingsDocuments{}, err
 	}
@@ -643,7 +701,7 @@ func resolveImage(projectName string, merged, globalOnly *config.Settings, regis
 		return image.Identity{}, err
 	}
 
-	globalEnabled, err := registry.ResolveEnabled(globalOnly.Container.EnabledAgents)
+	globalEnabled, err := registry.ResolveEnabledUnchecked(globalOnly.Container.EnabledAgents)
 	if err != nil {
 		// A global file naming an agent this machine no longer has must not break the run; the
 		// merged configuration is what actually gets built.
@@ -696,14 +754,15 @@ func userAgentHashes(enabledAgents []*agents.Agent) ([]string, error) {
 	return hashes, nil
 }
 
-// hashAgentDir digests a user agent's plugin files so editing one invalidates the image.
+// hashAgentDir digests a user agent's plugin files so editing one invalidates the image. Update-only
+// files are left out: they are not part of the image.
 func hashAgentDir(agent *agents.Agent) (string, error) {
 	var parts []string
 	err := fs.WalkDir(agent.Dir, ".", func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if entry.IsDir() {
+		if entry.IsDir() || assets.UpdateOnlyFile(path) {
 			return nil
 		}
 		data, err := fs.ReadFile(agent.Dir, path)
@@ -1000,6 +1059,24 @@ func reportServiceStartFailure(containerEngine *engine.Engine, instanceName, ser
 	for _, line := range lines {
 		logging.Warn("  %s", line)
 	}
+}
+
+// describeAgentImage renders the image for the start banner, with its in-place update history
+// when it has one.
+func describeAgentImage(identity image.Identity, info engine.ImageInfo, found bool) string {
+	if !found {
+		return identity.Describe()
+	}
+	generation := generationFromLabels(info.Size, info.Labels).describe()
+	if generation == "" {
+		return identity.Describe()
+	}
+	return identity.Describe() + " — " + generation
+}
+
+// agentUpdateCheckEnabled resolves container.agentUpdateCheck, which defaults to on.
+func agentUpdateCheckEnabled(settings *config.Settings) bool {
+	return settings.Container.AgentUpdateCheck == nil || *settings.Container.AgentUpdateCheck
 }
 
 // cachebustValue is a fresh value on rebuild so every Dockerfile layer after

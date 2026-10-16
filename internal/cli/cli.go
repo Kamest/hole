@@ -43,19 +43,22 @@ Options:
                                   .hole/logs/network-access-{agent}-{id}.log
   -r, --rebuild               Force rebuild of Docker images before starting
   -u, --unrestricted-network  Disable egress filtering; allow all network access
+      --update-agents         Update the enabled agent CLIs inside the existing image
+                                  before starting, without a full rebuild
       --library PATH[:MOUNT][:rw]  Mount an extra directory (repeatable). Mounted at
                                   its own host path unless MOUNT is given, and
                                   read-only unless :rw is given
       --with-docker           Enable Docker-in-Docker sidecar for the sandbox
-      --trust-project         Accept the host access this project's .hole/settings.json
+      --trust-project         Accept the host access this project's settings
                                   asks for without being asked, and remember it
   --                          Separator for agent-specific arguments;
                                   everything after -- is passed to the agent CLI
 
 Configure file exclusions, inclusions, libraries, allowed domains, dependencies,
 environment variables, container settings, agent arguments and hooks via
-.hole/settings.json (per-project) or ~/.hole/settings.json (global, or the file named by
-$HOLE_SETTINGS_FILE). Named overlays go under the "profiles" key and are selected with
+.hole/settings.json (per-project, or the file named by $HOLE_PROJECT_SETTINGS_FILE)
+or ~/.hole/settings.json (global, or the file named by $HOLE_SETTINGS_FILE).
+Named overlays go under the "profiles" key and are selected with
 {agent}:{profile}.
 
 Examples:
@@ -66,6 +69,7 @@ Examples:
   hole start claude . --dump-network-access
   hole start claude . -- -p "explain this function"
   hole start claude . --rebuild -- --output-format stream-json
+  hole start claude . --update-agents     # newest agent CLIs, setup hooks not re-run
   hole list                               # show running sandboxes
   hole destroy                            # destroy ALL Hole Docker resources
   hole destroy .                          # destroy resources for current project
@@ -86,6 +90,7 @@ type Invocation struct {
 	Unrestricted      bool
 	WithDocker        bool
 	TrustProject      bool
+	UpdateAgents      bool
 	// Libraries are the raw --library values, in the order they were given.
 	Libraries []string
 }
@@ -118,6 +123,8 @@ func Parse(args []string) (*Invocation, error) {
 			inv.WithDocker = true
 		case "--trust-project":
 			inv.TrustProject = true
+		case "--update-agents":
+			inv.UpdateAgents = true
 		case "--library":
 			// The value is the next argument; the `--library=x` form is handled below.
 			expectLibrary = true
@@ -254,6 +261,7 @@ func runStart(inv *Invocation) int {
 		DumpNetworkAccess: inv.DumpNetworkAccess,
 		WithDocker:        inv.WithDocker,
 		TrustProject:      inv.TrustProject,
+		UpdateAgents:      inv.UpdateAgents,
 		Libraries:         inv.Libraries,
 		AgentArgs:         inv.AgentArgs,
 	})

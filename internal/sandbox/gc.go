@@ -38,6 +38,25 @@ func GC(containerEngine *engine.Engine, host hostenv.Host, store *state.Store) {
 	collectContainers(containerEngine, store)
 	collectVolumes(containerEngine, store)
 	collectTmpDirs(host, store)
+	if live, ok := liveInstanceIDs(store); ok {
+		collectUpdateReferences(containerEngine, live)
+	}
+}
+
+// liveInstanceIDs are the instance IDs of every registered instance. Abandoned ones have been
+// torn down and deregistered by the time this is read. An unreadable registry yields false, so
+// nothing is collected on a guess.
+func liveInstanceIDs(store *state.Store) (map[string]bool, bool) {
+	instances, err := store.List()
+	if err != nil {
+		logging.Debug("could not read the instance registry: %v", err)
+		return nil, false
+	}
+	live := map[string]bool{}
+	for _, instance := range instances {
+		live[instance.InstanceID] = true
+	}
+	return live, true
 }
 
 // collectAbandonedInstances tears down instances whose CLI *and* watchdog are both gone.

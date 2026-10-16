@@ -1,4 +1,4 @@
-// Package trust gates the capabilities a project's own `.hole/settings.json` may grant.
+// Package trust gates the capabilities project settings may grant.
 //
 // The global settings file is the user's own document and is trusted implicitly. A project
 // file is repository content: pointing an agent at an untrusted repository is the workflow

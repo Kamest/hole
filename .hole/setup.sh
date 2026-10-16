@@ -42,17 +42,14 @@ if ! grep -q "$HOME/.local/go/bin" "$HOME/.bash_env" 2>/dev/null; then
     echo "$GO_PATH_EXPORT" >> "$HOME/.bash_env"
 fi
 
-# rtk
-# Note: enable if needed, but beware of the security implications
-echo "➡️ Installing rtk..."
-curl -fsSL https://raw.githubusercontent.com/novoj/rtk/refs/heads/master/install.sh | sh
+# golangci-lint — the same version CI pins (.github/workflows/ci.yml, golangci-lint-action
+# `version:`); keep the two in sync, or `make lint` here and the CI gate disagree.
+GOLANGCI_LINT_VERSION="v2.5.0"
+echo "➡️ Installing golangci-lint ${GOLANGCI_LINT_VERSION}..."
+curl -fsSL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+  | sh -s -- -b "$HOME/go/bin" "${GOLANGCI_LINT_VERSION}"
 
-export PATH="$HOME/.local/bin:$PATH"
-
-if ! command -v rtk >/dev/null 2>&1; then
-  echo "ERROR: rtk was installed but is still not in PATH" >&2
+if ! "$HOME/go/bin/golangci-lint" version >/dev/null 2>&1; then
+  echo "ERROR: golangci-lint was installed but does not run" >&2
   exit 1
 fi
-
-echo "➡️ Initializing rtk..."
-rtk init -g

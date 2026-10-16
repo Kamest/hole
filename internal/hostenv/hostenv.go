@@ -76,14 +76,20 @@ type Host struct {
 	// SettingsFile overrides the global settings document (HOLE_SETTINGS_FILE). Empty means
 	// the default under HoleDir; nothing else moves with it.
 	SettingsFile string
+	// ProjectSettingsFile overrides the main project's settings document
+	// (HOLE_PROJECT_SETTINGS_FILE). Empty means <project>/.hole/settings.json; libraries and
+	// other checkouts never follow it.
+	ProjectSettingsFile string
 }
 
-// DetectHost reads the host user identity and the HOLE_SETTINGS_FILE override.
+// DetectHost reads the host user identity and the HOLE_SETTINGS_FILE and
+// HOLE_PROJECT_SETTINGS_FILE overrides.
 func DetectHost() Host {
 	host := Host{
-		Username:     firstNonEmpty(os.Getenv("USER"), defaultUsername),
-		Home:         firstNonEmpty(os.Getenv("HOME"), defaultHome),
-		SettingsFile: os.Getenv("HOLE_SETTINGS_FILE"),
+		Username:            firstNonEmpty(os.Getenv("USER"), defaultUsername),
+		Home:                firstNonEmpty(os.Getenv("HOME"), defaultHome),
+		SettingsFile:        os.Getenv("HOLE_SETTINGS_FILE"),
+		ProjectSettingsFile: os.Getenv("HOLE_PROJECT_SETTINGS_FILE"),
 	}
 	if runtime.GOOS == "linux" {
 		host.UID = fmt.Sprint(os.Getuid())
@@ -148,18 +154,34 @@ func (h Host) GlobalSettingsFile() string {
 	return filepath.Join(h.HoleDir(), "settings.json")
 }
 
-// ValidateSettingsFile checks the HOLE_SETTINGS_FILE override. Unlike a missing default file, a
-// missing override is fatal: falling back to defaults would start a sandbox without the
-// configuration the caller explicitly asked for.
+// ProjectSettingsPath is the path of the main project's settings document:
+// HOLE_PROJECT_SETTINGS_FILE when set, <projectDir>/.hole/settings.json otherwise.
+func (h Host) ProjectSettingsPath(projectDir string) string {
+	if h.ProjectSettingsFile != "" {
+		return h.ProjectSettingsFile
+	}
+	return filepath.Join(projectDir, ".hole", "settings.json")
+}
+
+// ValidateSettingsFile checks the HOLE_SETTINGS_FILE and HOLE_PROJECT_SETTINGS_FILE overrides.
+// Unlike a missing default file, a missing override is fatal: falling back to the default would
+// start a sandbox without the configuration the caller explicitly asked for.
 func (h Host) ValidateSettingsFile() error {
-	if h.SettingsFile == "" {
+	if err := validateOverride("HOLE_SETTINGS_FILE", h.SettingsFile); err != nil {
+		return err
+	}
+	return validateOverride("HOLE_PROJECT_SETTINGS_FILE", h.ProjectSettingsFile)
+}
+
+func validateOverride(variable, path string) error {
+	if path == "" {
 		return nil
 	}
-	invalid := fmt.Errorf("HOLE_SETTINGS_FILE '%s' must be an absolute path to an existing settings file", h.SettingsFile)
-	if !filepath.IsAbs(h.SettingsFile) {
+	invalid := fmt.Errorf("%s '%s' must be an absolute path to an existing settings file", variable, path)
+	if !filepath.IsAbs(path) {
 		return invalid
 	}
-	info, err := os.Stat(h.SettingsFile)
+	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() {
 		return invalid
 	}
@@ -174,6 +196,10 @@ func (h Host) InstancesDir() string { return filepath.Join(h.HoleDir(), "instanc
 
 // LogDir holds per-run log files.
 func (h Host) LogDir() string { return filepath.Join(h.HoleDir(), "logs") }
+
+// AgentVersionsFile is the agent version state: installed versions per image, fetched latest
+// versions and declined updates.
+func (h Host) AgentVersionsFile() string { return filepath.Join(h.HoleDir(), "agent-versions.json") }
 
 // TmpRoot is the parent of all per-run temp directories. It lives under $HOME rather than
 // $TMPDIR because Colima/Lima/Podman-Machine VMs share $HOME but not /var/folders, and

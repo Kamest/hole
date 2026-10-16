@@ -49,6 +49,35 @@ func TestBuiltinAgentsAreComplete(t *testing.T) {
 		if len(scripts) == 0 {
 			t.Errorf("agent %q has no install script, so its CLI would not be installed", name)
 		}
+		// Builtins are offered for in-place updates, which needs both halves: a script that
+		// updates the CLI and a way to tell whether it did.
+		updates, err := agent.UpdateScripts()
+		if err != nil || len(updates) == 0 {
+			t.Errorf("agent %q has no update script: %v", name, err)
+		}
+		spec, err := agent.VersionSpec()
+		if err != nil || spec == nil {
+			t.Errorf("agent %q has no valid version.json: %v", name, err)
+		}
+	}
+}
+
+// Update scripts must never reach the main image build, whose COPY of agent-installs/ takes
+// every file InstallScripts returns.
+func TestInstallScriptsExcludeUpdateScripts(t *testing.T) {
+	registry, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, _ := registry.Get("claude")
+	scripts, err := agent.InstallScripts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name := range scripts {
+		if strings.HasPrefix(name, "update-") {
+			t.Errorf("InstallScripts returned %s", name)
+		}
 	}
 }
 
@@ -111,6 +140,14 @@ func TestPinnedNodeVersionMatchesTheInstallScript(t *testing.T) {
 		if err != nil {
 			t.Fatalf("agent %q command: %v", name, err)
 		}
+		// version.json runs the CLI with the same interpreter, so it carries the pin as well.
+		spec, err := agent.VersionSpec()
+		if err != nil {
+			t.Fatalf("agent %q version.json: %v", name, err)
+		}
+		if spec != nil {
+			command = append(command, spec.Command...)
+		}
 		pinned := map[string]bool{}
 		for _, part := range command {
 			if match := nodePath.FindStringSubmatch(part); match != nil {
@@ -121,7 +158,7 @@ func TestPinnedNodeVersionMatchesTheInstallScript(t *testing.T) {
 			continue
 		}
 		if len(pinned) > 1 {
-			t.Errorf("agent %q references more than one Node version in its command: %v", name, pinned)
+			t.Errorf("agent %q references more than one Node version in command.json and version.json: %v", name, pinned)
 		}
 
 		scripts, err := agent.InstallScripts()
@@ -138,6 +175,22 @@ func TestPinnedNodeVersionMatchesTheInstallScript(t *testing.T) {
 			if !found {
 				t.Errorf("agent %q pins Node v%s in command.json but no install script runs "+
 					"`nvm install %s`; the agent would fail to launch with ENOENT", name, version, version)
+			}
+		}
+
+		// nvm's default may be another Node (a setup hook installing a newer one makes it the
+		// default), so an update script has to run the pinned Node's npm by absolute path, or it
+		// updates the CLI of a Node the agent never runs and the update is offered forever.
+		updates, err := agent.UpdateScripts()
+		if err != nil {
+			t.Fatalf("agent %q update scripts: %v", name, err)
+		}
+		for file, body := range updates {
+			for version := range pinned {
+				if !strings.Contains(string(body), "/.nvm/versions/node/v"+version+"/bin") {
+					t.Errorf("agent %q %s does not run the pinned Node v%s by absolute path; "+
+						"it would update the CLI under nvm's default Node", name, file, version)
+				}
 			}
 		}
 	}
@@ -296,5 +349,104 @@ func TestUserAgentWithoutCommandFailsWhenUsed(t *testing.T) {
 	}
 	if _, err := agent.Command(); err == nil {
 		t.Error("an agent without command.json must fail when it is started")
+	}
+}
+
+func TestVersionSpecValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		valid   bool
+	}{
+		{"npm source", `{"command": ["x", "--version"], "latest": {"npm": "@scope/pkg"}}`, true},
+		{"url source", `{"command": ["x"], "latest": {"url": "https://example.com/latest"}}`, true},
+		{"npm path traversal", `{"command": ["x"], "latest": {"npm": "../../evil?x=1"}}`, false},
+		{"both sources", `{"command": ["x"], "latest": {"npm": "pkg", "url": "https://example.com"}}`, false},
+		{"no source", `{"command": ["x"], "latest": {}}`, false},
+		{"empty command", `{"command": [], "latest": {"npm": "pkg"}}`, false},
+		{"missing command", `{"latest": {"npm": "pkg"}}`, false},
+		{"not a URL", `{"command": ["x"], "latest": {"url": "downloads/latest"}}`, false},
+		{"file URL", `{"command": ["x"], "latest": {"url": "file:///etc/passwd"}}`, false},
+		{"unknown key", `{"command": ["x"], "latest": {"npm": "pkg"}, "extra": 1}`, false},
+		{"not JSON", `command: x`, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			userAgent(t, root, "versioned")
+			if err := os.WriteFile(filepath.Join(root, "versioned", "version.json"), []byte(test.content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			registry, err := Load(root)
+			if err != nil {
+				t.Fatalf("a malformed version.json must not fail the registry load: %v", err)
+			}
+			agent, _ := registry.Get("versioned")
+			spec, err := agent.VersionSpec()
+			if test.valid && (err != nil || spec == nil) {
+				t.Errorf("VersionSpec = %v, %v; want a spec", spec, err)
+			}
+			if !test.valid && err == nil {
+				t.Errorf("VersionSpec accepted %s", test.content)
+			}
+		})
+	}
+}
+
+func TestUserAgentWithoutUpdateFiles(t *testing.T) {
+	root := t.TempDir()
+	userAgent(t, root, "plain")
+	registry, err := Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, _ := registry.Get("plain")
+	if spec, err := agent.VersionSpec(); spec != nil || err != nil {
+		t.Errorf("VersionSpec = %v, %v; want none", spec, err)
+	}
+	if scripts, err := agent.UpdateScripts(); len(scripts) != 0 || err != nil {
+		t.Errorf("UpdateScripts = %v, %v; want none", scripts, err)
+	}
+}
+
+// An enabled agent has both update files or neither; a disabled agent is never checked.
+func TestResolveEnabledChecksUpdateFiles(t *testing.T) {
+	const version = `{"command": ["x", "--version"], "latest": {"npm": "pkg"}}`
+	tests := []struct {
+		name  string
+		files map[string]string
+		valid bool
+	}{
+		{"no update files", nil, true},
+		{"user script and version.json", map[string]string{"update-user.sh": "exit 0\n", "version.json": version}, true},
+		{"root script and version.json", map[string]string{"update-root.sh": "exit 0\n", "version.json": version}, true},
+		{"update script only", map[string]string{"update-user.sh": "exit 0\n"}, false},
+		{"version.json only", map[string]string{"version.json": version}, false},
+		{"malformed version.json", map[string]string{"update-user.sh": "exit 0\n", "version.json": `{}`}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			userAgent(t, root, "custom")
+			for file, content := range test.files {
+				if err := os.WriteFile(filepath.Join(root, "custom", file), []byte(content), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			registry, err := Load(root)
+			if err != nil {
+				t.Fatalf("update files must not fail the registry load: %v", err)
+			}
+			_, err = registry.ResolveEnabled([]string{"claude", "custom"})
+			if test.valid && err != nil {
+				t.Errorf("ResolveEnabled: %v", err)
+			}
+			if !test.valid && (err == nil || !strings.Contains(err.Error(), "custom")) {
+				t.Errorf("ResolveEnabled error = %v, want one naming the agent", err)
+			}
+			if _, err := registry.ResolveEnabled([]string{"claude"}); err != nil {
+				t.Errorf("a disabled agent was checked: %v", err)
+			}
+		})
 	}
 }
