@@ -567,7 +567,7 @@ func TestAgentUpdateCheckAndInPlaceUpdate(t *testing.T) {
 	}))
 	defer latest.Close()
 
-	home, projectDir := environment(t, `["bash", "-c", "echo AGENT_VERSION=$(cat $HOME/.test-agent-version)"]`, "")
+	home, projectDir := environment(t, `["bash", "-c", "sleep 3; echo AGENT_VERSION=$(cat $HOME/.test-agent-version)"]`, "")
 	agentDir := filepath.Join(home, ".hole", "agents", "test-agent")
 	write(t, filepath.Join(agentDir, "install-user.sh"), "#!/bin/bash\necho 1.0.0 > \"$HOME/.test-agent-version\"\n")
 	write(t, filepath.Join(agentDir, "update-user.sh"), "#!/bin/bash\necho 2.0.0 > \"$HOME/.test-agent-version\"\n")
