@@ -1,0 +1,4 @@
+{
+  "command": ["$HOME/.local/bin/claude", "--version"],
+  "latest": { "url": "https://downloads.claude.ai/claude-code-releases/latest" }
+}

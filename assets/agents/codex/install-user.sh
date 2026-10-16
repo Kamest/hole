@@ -20,3 +20,6 @@ nvm install 22.22.2
 nvm use 22.22.2
 
 npm install -g @openai/codex
+
+# The npm cache is ~300 MB of tarballs nothing in the sandbox reads again.
+npm cache clean --force

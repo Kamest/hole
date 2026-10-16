@@ -36,6 +36,8 @@ func TestValidateAcceptsKnownSettings(t *testing.T) {
 		`{"profiles":{"research":{"network":{"allow":["*.wikipedia.org"]}}}}`,
 		`{"profiles":{"a":{},"b":{"extends":"a"},"c":{"extends":["a","b"]}}}`,
 		`{"profiles":{"p":{"agents":{"claude":{"args":["--model","opus"]}},"dependencies":["make"]}}}`,
+		`{"container":{"agentUpdateCheck":false}}`,
+		`{"profiles":{"ci":{"container":{"agentUpdateCheck":false}}}}`,
 	}
 	for _, document := range valid {
 		if err := ValidateBytes([]byte(document), "test"); err != nil {
@@ -46,21 +48,22 @@ func TestValidateAcceptsKnownSettings(t *testing.T) {
 
 func TestValidateRejectsUnknownAndMalformedSettings(t *testing.T) {
 	invalid := map[string]string{
-		"unknown top-level key":    `{"nope":true}`,
-		"unknown nested key":       `{"container":{"nope":true}}`,
-		"wrong type":               `{"dependencies":"make"}`,
-		"malformed allow entry":    `{"network":{"allow":["not a host"]}}`,
-		"allow entry with spaces":  `{"network":{"allow":["example.com :443"]}}`,
-		"removed allowedPorts":     `{"network":{"allowedPorts":[443]}}`,
-		"removed domainWhitelist":  `{"network":{"domainWhitelist":["example.com"]}}`,
-		"scalar hooks.setup":       `{"hooks":{"setup":{"script":"a.sh"}}}`,
-		"malformed agent name":     `{"container":{"enabledAgents":["Not An Agent"]}}`,
-		"library relative path":    `{"libraries":{"lib":"relative/path"}}`,
-		"host gateway bad port":    `{"network":{"hostGatewayDomains":["mydb.local:notaport"]}}`,
-		"host gateway no port":     `{"network":{"hostGatewayDomains":["mydb.local"]}}`,
-		"malformed subnet pool":    `{"network":{"subnetPool":"not-a-cidr"}}`,
-		"bad bridge netfilter fix": `{"network":{"bridgeNetfilterFix":"maybe"}}`,
-		"hook entry without path":  `{"hooks":{"prestart":[{}]}}`,
+		"unknown top-level key":     `{"nope":true}`,
+		"unknown nested key":        `{"container":{"nope":true}}`,
+		"wrong type":                `{"dependencies":"make"}`,
+		"malformed allow entry":     `{"network":{"allow":["not a host"]}}`,
+		"allow entry with spaces":   `{"network":{"allow":["example.com :443"]}}`,
+		"removed allowedPorts":      `{"network":{"allowedPorts":[443]}}`,
+		"removed domainWhitelist":   `{"network":{"domainWhitelist":["example.com"]}}`,
+		"scalar hooks.setup":        `{"hooks":{"setup":{"script":"a.sh"}}}`,
+		"malformed agent name":      `{"container":{"enabledAgents":["Not An Agent"]}}`,
+		"library relative path":     `{"libraries":{"lib":"relative/path"}}`,
+		"host gateway bad port":     `{"network":{"hostGatewayDomains":["mydb.local:notaport"]}}`,
+		"host gateway no port":      `{"network":{"hostGatewayDomains":["mydb.local"]}}`,
+		"malformed subnet pool":     `{"network":{"subnetPool":"not-a-cidr"}}`,
+		"bad bridge netfilter fix":  `{"network":{"bridgeNetfilterFix":"maybe"}}`,
+		"agent update check string": `{"container":{"agentUpdateCheck":"no"}}`,
+		"hook entry without path":   `{"hooks":{"prestart":[{}]}}`,
 		// Profiles cannot nest, cannot redeclare $schema, and are strict about their keys.
 		"nested profiles":             `{"profiles":{"p":{"profiles":{"q":{}}}}}`,
 		"schema inside a profile":     `{"profiles":{"p":{"$schema":"x"}}}`,

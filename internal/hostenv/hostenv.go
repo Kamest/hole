@@ -175,6 +175,10 @@ func (h Host) InstancesDir() string { return filepath.Join(h.HoleDir(), "instanc
 // LogDir holds per-run log files.
 func (h Host) LogDir() string { return filepath.Join(h.HoleDir(), "logs") }
 
+// AgentVersionsFile is the agent version state: installed versions per image, fetched latest
+// versions and declined updates.
+func (h Host) AgentVersionsFile() string { return filepath.Join(h.HoleDir(), "agent-versions.json") }
+
 // TmpRoot is the parent of all per-run temp directories. It lives under $HOME rather than
 // $TMPDIR because Colima/Lima/Podman-Machine VMs share $HOME but not /var/folders, and
 // generated files in there must be bind-mountable into containers.

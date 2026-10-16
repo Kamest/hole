@@ -43,6 +43,8 @@ Options:
                                   .hole/logs/network-access-{agent}-{id}.log
   -r, --rebuild               Force rebuild of Docker images before starting
   -u, --unrestricted-network  Disable egress filtering; allow all network access
+      --update-agents         Update the enabled agent CLIs inside the existing image
+                                  before starting, without a full rebuild
       --library PATH[:MOUNT][:rw]  Mount an extra directory (repeatable). Mounted at
                                   its own host path unless MOUNT is given, and
                                   read-only unless :rw is given
@@ -66,6 +68,7 @@ Examples:
   hole start claude . --dump-network-access
   hole start claude . -- -p "explain this function"
   hole start claude . --rebuild -- --output-format stream-json
+  hole start claude . --update-agents     # newest agent CLIs, setup hooks not re-run
   hole list                               # show running sandboxes
   hole destroy                            # destroy ALL Hole Docker resources
   hole destroy .                          # destroy resources for current project
@@ -86,6 +89,7 @@ type Invocation struct {
 	Unrestricted      bool
 	WithDocker        bool
 	TrustProject      bool
+	UpdateAgents      bool
 	// Libraries are the raw --library values, in the order they were given.
 	Libraries []string
 }
@@ -118,6 +122,8 @@ func Parse(args []string) (*Invocation, error) {
 			inv.WithDocker = true
 		case "--trust-project":
 			inv.TrustProject = true
+		case "--update-agents":
+			inv.UpdateAgents = true
 		case "--library":
 			// The value is the next argument; the `--library=x` form is handled below.
 			expectLibrary = true
@@ -254,6 +260,7 @@ func runStart(inv *Invocation) int {
 		DumpNetworkAccess: inv.DumpNetworkAccess,
 		WithDocker:        inv.WithDocker,
 		TrustProject:      inv.TrustProject,
+		UpdateAgents:      inv.UpdateAgents,
 		Libraries:         inv.Libraries,
 		AgentArgs:         inv.AgentArgs,
 	})

@@ -33,9 +33,14 @@ a daemon, `make test` is not `-race`) and how to match CI locally:
 
 1. Create `assets/agents/<name>/` with `command.json`, `allow.txt`, and the install scripts it
    needs. The embed directive already covers the directory, so nothing else needs registering.
-2. Add it to the README's agent list, with its authentication mount.
-3. `make test` — the registry test asserts every builtin has a parseable command, a non-empty
-   allow list and at least one install script.
+   Install scripts end by cleaning their package manager's cache.
+2. Add `update-user.sh` (and `update-root.sh` if the agent has system-level parts) plus
+   `version.json`, so the agent takes part in [in-place updates](agents.md#in-place-agent-updates).
+   If the command names a pinned Node by path, `version.json` names the same one.
+3. Add it to the README's agent list, with its authentication mount, and its files to
+   `TestEmbeddedTreeIsComplete`.
+4. `make test` — the registry test asserts every builtin has a parseable command, a non-empty
+   allow list, at least one install script, an update script and a valid `version.json`.
 
 There is no `VALID_AGENTS` list to update any more, and no schema enum: agent names are validated
 against the registry at runtime.

@@ -651,7 +651,9 @@ Images are tagged with the first 12 hex characters of a sha1 over a manifest of:
 2. **host identity** — username and home always, UID/GID on Linux, so two host users sharing a
    daemon never collide;
 3. **Hole's own build inputs** — the digest of the embedded assets, plus file hashes of enabled
-   user agents.
+   user agents. Both leave out the update-only files (`update-*.sh`, `version.json`,
+   `Dockerfile.update`; `assets.UpdateOnlyFile`): they are not part of the image, and the update
+   build reads the current ones, so changing one must not rebuild anything.
 
 `CACHEBUST` is deliberately absent: it is a rebuild trigger, not configuration.
 
@@ -672,6 +674,7 @@ upgrade able to replace it. Superseded gateway tags are collected by the same im
 | `network.*` | no — runtime config mounts (`bridgeNetfilterFix` acts on the host firewall at start, not on any image) |
 | `environment`, `agents.*.args` | no — compose environment / command |
 | `container.memoryLimit`, `memorySwapLimit` | no — compose limits |
+| `container.agentUpdateCheck` | no — runtime only: decides whether the start compares agent versions; an accepted update changes the image *content* but never its tag (below) |
 | `container.docker`, `--with-docker` | no — sidecar only; the Docker CLI and its compose/buildx plugins are always baked in |
 | `hooks.prestart` | no — runtime read-only mount |
 | `hooks.setupHost`, `cleanupHost` | no — host-side |
@@ -696,7 +699,8 @@ build context could diverge.
 
 **Adoption.** The repository name is keyed by path (`sanitize(basename)-sha1(absPath)[:8]`) and
 carries no content information, so sibling checkouts of one project land in different repositories
-even when their images would be bit-identical. Before starting the agent service, `adoptExistingImage`
+even when their images would be bit-identical. Right after the image is resolved — before the
+banner and the agent version check, so an adopted image counts as existing — `adoptExistingImage`
 (`internal/sandbox/imageadopt.go`) looks for any `hole-sandbox/agent-*` image already carrying the
 target tag and re-tags it into this project's repository; compose then finds the image present and
 skips the build. The tag hashes the *closed* set of build inputs — every build argument and every
@@ -710,6 +714,16 @@ not change; only whether the image is already there when compose looks.
 The one input the tag does not capture is upstream drift, since `CACHEBUST` is excluded, so an
 adopted image may hold older apt/npm versions than a fresh build. That is not a new staleness class:
 the same tag in the *same* repository is already reused across days. `-r` remains the escape hatch.
+
+**In-place agent updates** (`--update-agents`, or a `Y` at the start's version prompt) are the one
+way an image's content changes under an unchanged tag: a thin layer built from
+`assets/agents/Dockerfile.update` on top of the current image replaces it under the same reference
+(see [agents](agents.md#in-place-agent-updates)). The manifest is untouched, so the tag stays and
+sibling workspaces adopt the updated image like any other. The flip side is that updates are not
+sticky: any settings change that yields a new tag builds from the cache with the CLI versions of the
+original build. `container.agentUpdateCheck` is not trust-gated — it only decides whether the host
+fetches version numbers from URLs the agent plugins (builtin or `~/.hole/agents`, never the project)
+declare.
 
 **Image GC** runs after the agent service is up — never before, or a failed build could have
 destroyed the last working image. It removes the other tags of the chosen repository, drops the

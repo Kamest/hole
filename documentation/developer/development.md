@@ -73,7 +73,12 @@ subnet allocation race, every GC pass including its keep-conditions, teardown co
 idempotence, the registry mirror lifecycle, and the version-change migration. They fabricate the
 resources a sandbox would own instead of building images, so they finish in seconds.
 
-The one exception is `internal/sandbox/gateway_integration_test.go`, which builds the real gateway
+`internal/sandbox/agentupdate_integration_test.go` builds images too, but only tiny ones: an
+alpine stand-in for the sandbox image (busybox `sh` as `bash`, a `runuser` stub forwarding to
+busybox `su`) and the real `Dockerfile.update` on top of it, offline, in a few seconds. On docker it
+skips unless the active buildx builder uses the `docker` driver.
+
+The one exception that needs the network is `internal/sandbox/gateway_integration_test.go`, which builds the real gateway
 image and runs its entrypoint against a fabricated `/etc/hosts` — the only way to reproduce how a
 runtime hands over the host gateway address. It reuses an already-built image and otherwise needs
 network access for the build (GitHub for CoreDNS, the Ubuntu mirrors for packages); without it the
@@ -112,8 +117,10 @@ Three traps:
 
 `go test -tags e2e -count=1 -timeout 60m -v ./test/e2e/`. Full start → attach → exit →
 zero-leftovers runs, plus default-deny versus allowed domains, the `-n` domain dump, exclusion
-hiding, hooks, `destroy`, and the watchdog matrix (SIGINT, `kill -9` of the CLI, `kill -9` of the
-watchdog, `kill -9` of both).
+hiding, hooks, `destroy`, the agent version check and in-place update (the test agent gets an
+update script and a `version.json` whose latest version an `httptest` server on the host serves),
+and the watchdog matrix (SIGINT, `kill -9` of the CLI, `kill -9` of the watchdog, `kill -9` of
+both).
 
 **Budget 10–20 minutes** with a warm image cache, more on a cold one (the `ubuntu:24.04` pull and
 two image builds). The tests are strictly sequential — no `t.Parallel()` — and each one is a real

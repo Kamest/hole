@@ -1,0 +1,39 @@
+# Thin layer over an existing sandbox image that runs the agents' own update scripts, so newer
+# agent CLIs arrive without re-running the full build (and its setup hooks). BASE is a tag Hole
+# puts on the exact image ID it read the labels from; the default only names what is missing.
+ARG BASE=hole-sandbox/agent-update:base-not-set
+FROM ${BASE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG AGENT_USERNAME
+ARG CLEAN_SIZE
+ARG AGENT_UPDATES
+
+USER root
+
+COPY agent-updates/ /tmp/agent-updates/
+
+# One RUN for root and user parts: two layers per update in total, which keeps far below the
+# overlay layer limit. HOME is inherited as the sandbox home, so root scripts get /root
+# explicitly; user scripts get the sandbox user's environment.
+RUN chmod -R a+rX /tmp/agent-updates \
+    && for script in /tmp/agent-updates/*/update-root.sh; do \
+      [ -f "${script}" ] || continue; \
+      echo "Updating $(basename "$(dirname "${script}")") (root phase)..."; \
+      chmod +x "${script}" && HOME=/root "${script}" || exit 1; \
+    done \
+    && for script in /tmp/agent-updates/*/update-user.sh; do \
+      [ -f "${script}" ] || continue; \
+      echo "Updating $(basename "$(dirname "${script}")")..."; \
+      chmod +x "${script}" \
+        && runuser -u "${AGENT_USERNAME}" -- env HOME="${HOME}" BASH_ENV="${BASH_ENV:-}" PATH="${PATH}" "${script}" \
+        || exit 1; \
+    done \
+    && rm -rf /tmp/agent-updates
+
+LABEL com.hole.clean-size="${CLEAN_SIZE}" \
+      com.hole.agent-updates="${AGENT_UPDATES}"
+
+# Last, or every container started from the updated image would run as root.
+USER ${AGENT_USERNAME}
