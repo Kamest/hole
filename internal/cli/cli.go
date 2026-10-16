@@ -49,15 +49,16 @@ Options:
                                   its own host path unless MOUNT is given, and
                                   read-only unless :rw is given
       --with-docker           Enable Docker-in-Docker sidecar for the sandbox
-      --trust-project         Accept the host access this project's .hole/settings.json
+      --trust-project         Accept the host access this project's settings
                                   asks for without being asked, and remember it
   --                          Separator for agent-specific arguments;
                                   everything after -- is passed to the agent CLI
 
 Configure file exclusions, inclusions, libraries, allowed domains, dependencies,
 environment variables, container settings, agent arguments and hooks via
-.hole/settings.json (per-project) or ~/.hole/settings.json (global, or the file named by
-$HOLE_SETTINGS_FILE). Named overlays go under the "profiles" key and are selected with
+.hole/settings.json (per-project, or the file named by $HOLE_PROJECT_SETTINGS_FILE)
+or ~/.hole/settings.json (global, or the file named by $HOLE_SETTINGS_FILE).
+Named overlays go under the "profiles" key and are selected with
 {agent}:{profile}.
 
 Examples:

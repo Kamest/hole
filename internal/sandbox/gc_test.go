@@ -190,4 +190,15 @@ func TestSettingsLabel(t *testing.T) {
 	if got := settingsLabel(host, instance); got != "global(/opt/wrapper/settings.json)+project" {
 		t.Errorf("settingsLabel = %q, want global(/opt/wrapper/settings.json)+project", got)
 	}
+
+	// A run started with HOLE_PROJECT_SETTINGS_FILE names the project document by path; without
+	// the recorded override (an older registry record) the same files label as before.
+	instance.SettingsFiles = []string{"/home/dev/.hole/settings.json", "/opt/wrapper/project.json"}
+	if got := settingsLabel(host, instance); got != "global(~/.hole/settings.json)+global(/opt/wrapper/project.json)" {
+		t.Errorf("settingsLabel without the recorded override = %q", got)
+	}
+	instance.ProjectSettingsFile = "/opt/wrapper/project.json"
+	if got := settingsLabel(host, instance); got != "global(~/.hole/settings.json)+project(/opt/wrapper/project.json)" {
+		t.Errorf("settingsLabel = %q, want global(~/.hole/settings.json)+project(/opt/wrapper/project.json)", got)
+	}
 }

@@ -292,6 +292,24 @@ func TestGlobalSettingsFileOverride(t *testing.T) {
 	}
 }
 
+func TestProjectSettingsPathOverride(t *testing.T) {
+	host := Host{Home: "/home/tester"}
+	if got := host.ProjectSettingsPath("/projects/demo"); got != "/projects/demo/.hole/settings.json" {
+		t.Errorf("default ProjectSettingsPath = %q", got)
+	}
+
+	host.ProjectSettingsFile = "/opt/wrapper/project.json"
+	if got := host.ProjectSettingsPath("/projects/demo"); got != "/opt/wrapper/project.json" {
+		t.Errorf("overridden ProjectSettingsPath = %q", got)
+	}
+	if got := host.GlobalSettingsFile(); got != "/home/tester/.hole/settings.json" {
+		t.Errorf("GlobalSettingsFile = %q moved with HOLE_PROJECT_SETTINGS_FILE", got)
+	}
+	if got := host.HoleDir(); got != "/home/tester/.hole" {
+		t.Errorf("HoleDir = %q moved with HOLE_PROJECT_SETTINGS_FILE", got)
+	}
+}
+
 func TestValidateSettingsFile(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "settings.json")
@@ -299,20 +317,33 @@ func TestValidateSettingsFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	tests := map[string]struct {
-		settingsFile string
-		wantErr      bool
+		settingsFile        string
+		projectSettingsFile string
+		wantErr             string
 	}{
-		"unset":    {settingsFile: "", wantErr: false},
-		"relative": {settingsFile: "settings.json", wantErr: true},
-		"missing":  {settingsFile: filepath.Join(dir, "missing.json"), wantErr: true},
-		"dir":      {settingsFile: dir, wantErr: true},
-		"ok":       {settingsFile: file, wantErr: false},
+		"unset":            {},
+		"relative":         {settingsFile: "settings.json", wantErr: "HOLE_SETTINGS_FILE"},
+		"missing":          {settingsFile: filepath.Join(dir, "missing.json"), wantErr: "HOLE_SETTINGS_FILE"},
+		"dir":              {settingsFile: dir, wantErr: "HOLE_SETTINGS_FILE"},
+		"ok":               {settingsFile: file},
+		"project relative": {projectSettingsFile: "settings.json", wantErr: "HOLE_PROJECT_SETTINGS_FILE"},
+		"project missing":  {projectSettingsFile: filepath.Join(dir, "missing.json"), wantErr: "HOLE_PROJECT_SETTINGS_FILE"},
+		"project dir":      {projectSettingsFile: dir, wantErr: "HOLE_PROJECT_SETTINGS_FILE"},
+		"project ok":       {projectSettingsFile: file},
+		"both ok":          {settingsFile: file, projectSettingsFile: file},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			err := Host{Home: "/home/tester", SettingsFile: test.settingsFile}.ValidateSettingsFile()
-			if (err != nil) != test.wantErr {
-				t.Errorf("ValidateSettingsFile() error = %v, wantErr %v", err, test.wantErr)
+			host := Host{Home: "/home/tester", SettingsFile: test.settingsFile, ProjectSettingsFile: test.projectSettingsFile}
+			err := host.ValidateSettingsFile()
+			if test.wantErr == "" {
+				if err != nil {
+					t.Errorf("ValidateSettingsFile() error = %v, want none", err)
+				}
+				return
+			}
+			if err == nil || !strings.HasPrefix(err.Error(), test.wantErr+" ") {
+				t.Errorf("ValidateSettingsFile() error = %v, want one naming %s", err, test.wantErr)
 			}
 		})
 	}

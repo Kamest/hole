@@ -17,6 +17,17 @@ missing override is fatal rather than a silent fall-back to defaults. The path t
 is recorded in `Instance.SettingsFiles`, which `hole list` labels from (`global(<path>)`), not from
 the listing process's own environment.
 
+The main project's document comes from `Host.ProjectSettingsPath(projectDir)`:
+`HOLE_PROJECT_SETTINGS_FILE` replaces `<project>/.hole/settings.json` when set. It occupies the
+project slot of the same two-document pipeline, so `ResolveChain`, `MergeWithProfile`, the
+`globalOnly` image baseline and the trust gate are unchanged; the in-repo file is not read at all
+(its `files.exclude` included — hiding repository secrets is then the wrapper's job), and
+`loadSettingsDocument` logs that it was ignored. `ValidateSettingsFile` checks it like
+`HOLE_SETTINGS_FILE`. Libraries, derived worktrees and pool checkouts never follow it
+(`addCheckoutExclusions` keeps reading `<checkout>/.hole/settings.json`). The override is recorded
+in `Instance.ProjectSettingsFile`, from which `hole list` labels it `project(<path>)` — positional
+inference from `SettingsFiles` is ambiguous when no global file exists.
+
 User-facing reference and examples live in the [README](../../README.md#configuration); this page
 documents the mechanics.
 
@@ -112,6 +123,11 @@ Three details carry the design:
   before any host hook. The default `~/.hole/settings.json` is not checked — mounting `~/.hole` is
   already a gated choice. Scripts the global file references are out of scope, as they are for the
   default file.
+- **`HOLE_PROJECT_SETTINGS_FILE` is gated like the in-repo file** — `trust.Gate` sees its document
+  and names its path, and trust stays keyed by `ProjectDir` and the grant-set digest. It therefore
+  needs no exposure check: an agent that can write it can only produce a grant set the next start
+  prompts for, the same as editing `<project>/.hole/settings.json`. Only `--trust-project` on every
+  run removes that prompt, which the README warns about.
 
 Without a terminal the start fails, naming the file, the keys and `--trust-project`; that flag
 accepts the current grant set non-interactively and records it. Failing to *write* the record is a
