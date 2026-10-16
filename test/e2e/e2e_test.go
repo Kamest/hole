@@ -112,12 +112,12 @@ func write(t *testing.T, path, content string) {
 // the plugin sits in a system directory.
 //
 // An explicit DOCKER_CONFIG is honored, so a developer can point the suite at a different client
-// configuration. An exported HOLE_SETTINGS_FILE is not: it would replace every test's global
-// settings with the developer's.
+// configuration. An exported HOLE_SETTINGS_FILE or HOLE_PROJECT_SETTINGS_FILE is not: it would
+// replace every test's global or project settings with the developer's.
 func holeEnv(home string) []string {
 	var env []string
 	for _, entry := range os.Environ() {
-		if !strings.HasPrefix(entry, "HOLE_SETTINGS_FILE=") {
+		if !strings.HasPrefix(entry, "HOLE_SETTINGS_FILE=") && !strings.HasPrefix(entry, "HOLE_PROJECT_SETTINGS_FILE=") {
 			env = append(env, entry)
 		}
 	}
@@ -423,6 +423,33 @@ func TestSettingsFileOverrideKeepsProjectTildeIncludes(t *testing.T) {
 	}
 	if !strings.Contains(output, "FROM=override") {
 		t.Errorf("the global settings did not come from HOLE_SETTINGS_FILE:\n%s", output)
+	}
+	assertNoLeftovers(t, projectDir)
+}
+
+// HOLE_PROJECT_SETTINGS_FILE replaces the project's .hole/settings.json: the in-repo file's include
+// must not reach the sandbox, the override's must.
+func TestProjectSettingsFileOverrideReplacesProjectFile(t *testing.T) {
+	inRepo := `{"container":{"enabledAgents":["test-agent"]},"files":{"include":{"~/repo.txt":{"path":"/tmp/repo.txt"}}}}`
+	command := `["bash", "-c", "sleep 3; cat /tmp/repo.txt /tmp/override.txt"]`
+	home, projectDir := environment(t, command, inRepo)
+	write(t, filepath.Join(home, "repo.txt"), "HOLE_E2E_FROM_REPO\n")
+	write(t, filepath.Join(home, "override.txt"), "HOLE_E2E_FROM_OVERRIDE\n")
+	override := filepath.Join(t.TempDir(), "wrapper-project-settings.json")
+	write(t, override, `{"container":{"enabledAgents":["test-agent"]},"files":{"include":{"~/override.txt":{"path":"/tmp/override.txt"}}}}`)
+
+	cmd := exec.Command(holeBinary, "start", "test-agent", projectDir, "--trust-project")
+	cmd.Env = append(holeEnv(home), "HOLE_PROJECT_SETTINGS_FILE="+override)
+	output, err := runWithTimeout(cmd, 20*time.Minute)
+	var exitErr *exec.ExitError
+	if !asExitError(err, &exitErr) || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected the agent to exit 1 (repo.txt is missing), got %v:\n%s", err, output)
+	}
+	if !strings.Contains(output, "HOLE_E2E_FROM_OVERRIDE") {
+		t.Errorf("the override's include was not mounted:\n%s", output)
+	}
+	if strings.Contains(output, "HOLE_E2E_FROM_REPO") {
+		t.Errorf("the in-repo settings file was applied despite HOLE_PROJECT_SETTINGS_FILE:\n%s", output)
 	}
 	assertNoLeftovers(t, projectDir)
 }

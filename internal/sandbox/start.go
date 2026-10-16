@@ -156,7 +156,7 @@ func Start(opts Options) (exitCode int, err error) {
 	// declines the project's grants must not have recorded one.
 	if err := trust.Gate(trust.Options{
 		ProjectDir:   opts.ProjectDir,
-		SettingsFile: projectSettingsFile(opts.ProjectDir),
+		SettingsFile: host.ProjectSettingsPath(opts.ProjectDir),
 		Document:     documents.project,
 		Store:        trust.NewStore(host.HoleDir()),
 		Interactive:  engine.IsTerminal(os.Stdin),
@@ -195,6 +195,9 @@ func Start(opts Options) (exitCode int, err error) {
 	if snapshot, err := json.Marshal(documents.merged); err == nil {
 		instance.Settings = snapshot
 		instance.SettingsFiles = documents.files
+		if host.ProjectSettingsPath(opts.ProjectDir) != projectSettingsFile(opts.ProjectDir) {
+			instance.ProjectSettingsFile = host.ProjectSettingsFile
+		}
 		if err := store.Write(instance); err != nil {
 			logging.Warn("could not update the instance registry: %v", err)
 		}
@@ -555,7 +558,8 @@ func attach(containerEngine *engine.Engine, container string) int {
 	return 1
 }
 
-// projectSettingsFile is the per-project settings path.
+// projectSettingsFile is the in-repo project settings path, which HOLE_PROJECT_SETTINGS_FILE
+// may replace for the main project (see hostenv.Host.ProjectSettingsPath).
 func projectSettingsFile(projectDir string) string {
 	return filepath.Join(projectDir, ".hole", "settings.json")
 }
@@ -580,13 +584,22 @@ type settingsDocuments struct {
 // project profile can extend a globally-defined one and vice versa.
 func loadSettingsDocument(host hostenv.Host, projectDir, profile string) (settingsDocuments, error) {
 	globalPath := host.GlobalSettingsFile()
-	projectPath := projectSettingsFile(projectDir)
+	projectPath := host.ProjectSettingsPath(projectDir)
+	projectLabel := "project settings (.hole/settings.json)"
+	// The override replaces the in-repo file entirely, its files.exclude included, so a human
+	// running the command by hand must see that the repository's own file was skipped.
+	if inRepo := projectSettingsFile(projectDir); projectPath != inRepo {
+		projectLabel = fmt.Sprintf("project settings (HOLE_PROJECT_SETTINGS_FILE %s)", projectPath)
+		if _, err := os.Stat(inRepo); err == nil {
+			logging.Info("ignoring %s: project settings come from HOLE_PROJECT_SETTINGS_FILE (%s)", inRepo, projectPath)
+		}
+	}
 
 	globalDoc, err := config.LoadAndValidate(globalPath, fmt.Sprintf("global settings (%s)", globalPath))
 	if err != nil {
 		return settingsDocuments{}, err
 	}
-	projectDoc, err := config.LoadAndValidate(projectPath, "project settings (.hole/settings.json)")
+	projectDoc, err := config.LoadAndValidate(projectPath, projectLabel)
 	if err != nil {
 		return settingsDocuments{}, err
 	}

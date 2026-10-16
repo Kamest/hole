@@ -49,6 +49,9 @@ type Instance struct {
 
 	// SettingsFiles are the settings documents that contributed to this run, for `hole list`.
 	SettingsFiles []string `json:"settingsFiles,omitempty"`
+	// ProjectSettingsFile is the HOLE_PROJECT_SETTINGS_FILE override the run read in place of
+	// <project>/.hole/settings.json; empty when it read the in-repo file.
+	ProjectSettingsFile string `json:"projectSettingsFile,omitempty"`
 	// Settings is the merged settings snapshot. The watchdog runs cleanupHost hooks from it,
 	// since it cannot re-read files that may have changed (or vanished) since startup.
 	Settings json.RawMessage `json:"settings,omitempty"`

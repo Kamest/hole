@@ -85,6 +85,7 @@ func agentLabel(instance *state.Instance) string {
 // settingsLabel names which settings documents were merged for the run. The global document is
 // named by the path the run recorded, not by the listing process's GlobalSettingsFile: a run
 // started with HOLE_SETTINGS_FILE read a different file than a plain `hole list` would assume.
+// A HOLE_PROJECT_SETTINGS_FILE override is named by path too; the in-repo file stays `project`.
 func settingsLabel(host hostenv.Host, instance *state.Instance) string {
 	if len(instance.SettingsFiles) == 0 {
 		return "defaults"
@@ -93,6 +94,10 @@ func settingsLabel(host hostenv.Host, instance *state.Instance) string {
 	for _, file := range instance.SettingsFiles {
 		if file == projectSettingsFile(instance.ProjectPath) {
 			labels = append(labels, "project")
+			continue
+		}
+		if file == instance.ProjectSettingsFile {
+			labels = append(labels, "project("+abbreviateHome(host, file)+")")
 			continue
 		}
 		labels = append(labels, "global("+abbreviateHome(host, file)+")")

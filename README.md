@@ -82,7 +82,7 @@ Run without a terminal — from a script, a CI job, or with the output piped —
 | `--update-agents` | Update the enabled agent CLIs inside the existing image before starting, without a full rebuild; see [updating agents](#updating-agents) |
 | `-u`, `--unrestricted-network` | Disable egress filtering; allow all network access |
 | `--with-docker` | Enable the Docker-in-Docker sidecar |
-| `--trust-project` | Accept whatever the project's own `.hole/settings.json` asks for beyond the sandbox — host access and network widening alike — without being asked, and remember it; see [project trust](#project-trust) |
+| `--trust-project` | Accept whatever the project's own settings ask for beyond the sandbox — host access and network widening alike — without being asked, and remember it; see [project trust](#project-trust) |
 | `--library PATH[:MOUNT][:rw]` | Mount an extra directory (repeatable); mounted at its own host path unless `MOUNT` is given, read-only unless `:rw` |
 | `--` | Everything after this is passed verbatim to the agent CLI |
 
@@ -175,7 +175,7 @@ hole uninstall                 # remove Hole's Docker resources and the binary
 hole help                      # usage
 ```
 
-`hole list` shows the instance ID, agent (and profile), project path, uptime, whether Docker-in-Docker is enabled, the sandbox network, and which settings files were merged — the global one by path, e.g. `global(~/.hole/settings.json)+project`, so a sandbox started with [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file) shows which file it runs with.
+`hole list` shows the instance ID, agent (and profile), project path, uptime, whether Docker-in-Docker is enabled, the sandbox network, and which settings files were merged — the global one by path, e.g. `global(~/.hole/settings.json)+project`, so a sandbox started with [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file) shows which file it runs with. A [`HOLE_PROJECT_SETTINGS_FILE`](#alternative-project-settings-file) override is named by path too, e.g. `project(/path/to/project-settings.json)`; the in-repo file stays plain `project`.
 
 ## Installation
 
@@ -457,7 +457,7 @@ and its npm would update a CLI the agent never runs.
 Two optional files, sharing one schema:
 
 - `~/.hole/settings.json` — global defaults (or the file named by [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file))
-- `<project>/.hole/settings.json` — per-project settings
+- `<project>/.hole/settings.json` — per-project settings (or the file named by [`HOLE_PROJECT_SETTINGS_FILE`](#alternative-project-settings-file))
 
 They are merged: objects deep-merge with the project winning, arrays concatenate (global first) and deduplicate, and scalars are overridden by the project.
 
@@ -484,6 +484,22 @@ HOLE_SETTINGS_FILE=/path/to/generated-settings.json hole start claude .
 - It must be an absolute path to an existing file; anything else stops the start instead of silently falling back to the default settings.
 - It must not lie inside the project or inside any included, library or worktree path: the global file is trusted without a prompt, so an agent that could edit it could add a `hooks.setupHost` that runs on your host at the next start. Hole refuses to start in that case (symlinks are followed).
 - Relative paths inside it (hook scripts, for example) resolve against the **project**, like in any settings file — a wrapper shipping scripts beside the file should reference them by absolute path.
+
+### Alternative project settings file
+
+A wrapper can likewise replace the project's own settings document:
+
+```sh
+HOLE_PROJECT_SETTINGS_FILE=/path/to/project-settings.json hole start claude .
+```
+
+- The file **replaces** `<project>/.hole/settings.json` for that run — the two are not merged, and the in-repo file is ignored completely (Hole says so when it exists). The global settings (`~/.hole/settings.json` or [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file)) are merged underneath as usual, and profiles resolve across both.
+- **The in-repo `files.exclude` no longer applies.** Secrets the repository asks to hide stay visible to the agent unless the override or the global settings exclude them too.
+- Only the main project is affected. Libraries, derived worktrees and worktree-pool checkouts keep reading their own `.hole/settings.json`.
+- It is still subject to [project trust](#project-trust), exactly like the in-repo file: a wrapper that must not prompt passes `--trust-project`, and an override asking for a different set of grants asks again.
+- It must be an absolute path to an existing file; anything else stops the start instead of silently falling back to the in-repo file.
+- Relative paths inside it resolve against the **project**, like in any settings file.
+- A wrapper that passes `--trust-project` on every run must not keep the file inside a path mounted into any sandbox: an agent could plant grants there that the next start accepts without asking, and unlike the in-repo file the override is not under the repository's review.
 
 ### Project trust
 

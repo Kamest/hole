@@ -323,7 +323,8 @@ the boundary, not the user. `NET_ADMIN` on the agent is likewise safe — the on
 through the gateway, so rewriting routes inside the agent can break its own connectivity but
 never widen it.
 
-**Project settings are untrusted input.** `<project>/.hole/settings.json` is repository content,
+**Project settings are untrusted input.** `<project>/.hole/settings.json` is repository content
+(and a `$HOLE_PROJECT_SETTINGS_FILE` replacing it is treated as the same input),
 and a few of its keys reach past the sandbox: `hooks.setupHost`/`cleanupHost` run scripts as the
 invoking user, `files.include`/`libraries` mount host paths, `container.docker` adds the privileged
 sidecar, `network.hostGatewayDomains` reaches services on the developer's machine,
