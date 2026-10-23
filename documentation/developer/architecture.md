@@ -49,7 +49,8 @@ directory to keep in sync. See [guidelines](guidelines.md#non-negotiable-rules).
   for image repositories and `hole destroy <path>`. The hash covers the path **as written**, not
   the sanitized form: sanitizing loses `_` and case, and `hole destroy` force-removes by this
   prefix — so a collision would tear down a live sandbox of a different project.
-- **Instance ID**: 6 random `[a-z0-9]` characters from `crypto/rand`.
+- **Instance ID**: 6 random `[a-z0-9]` characters from `crypto/rand`, or the caller's choice with
+  `hole start --instance-id` (same format, `hostenv.ValidateInstanceID`).
 - **Instance name**: `hole-sandbox-<project_name>-<instance_id>` — the compose project name, the
   network name prefix, and the container name prefix.
 
@@ -119,9 +120,22 @@ removed outright when it times out.
 
 ## Startup sequence
 
-1. Resolve host identity, project name and instance ID; create the run temp directory.
-2. Write the instance state file **before any Docker resource exists**, take the run's liveness
-   lock, and spawn the teardown watchdog. From here on, an abort anywhere has an owner.
+1. Register the signal handlers first (`notifySignals`): from here on a signal is buffered on a
+   channel instead of killing the process with nothing cleaned up. Resolve host identity, project
+   name and instance ID. A caller-chosen ID (`--instance-id`) is claimed before anything is
+   created (`claimInstanceID`): it is rejected when a live instance of any project uses it, or when
+   an abandoned instance with the same name still has leftovers.
+2. Take the run's liveness lock, clear stale `.abort`/`.stopping` markers a previous run with the
+   same name may have left, create the run temp directory (after the lock, so a rejected twin
+   start leaves nothing behind), write the instance state file (phase `starting`) **before any Docker
+   resource exists**, spawn the teardown watchdog, and start consuming signals
+   (`watchSignals`). From here on, an abort anywhere has an owner.
+
+   The lock comes **before** the first write: a state file without a held lock and without a
+   watchdog PID is `Abandoned`, so a concurrent `hole list` (whose GC runs on every call) would
+   tear down the instance that is starting. The lock is also what rejects a twin start with the
+   same caller-chosen ID in the same project, which `claimInstanceID` cannot see before it has
+   written its state.
 3. Validate and merge the settings documents (with the selected profile's chain, if any); resolve
    the agent registry and verify the startup agent is enabled.
 4. Resolve `cleanupHost` hooks and snapshot the merged settings into the state file, so teardown
@@ -164,6 +178,22 @@ removed outright when it times out.
     `/dev/null` is a character device, and `/dev/null` is exactly what a non-interactive run gets
     for stdin.
 11. After the agent exits, mirror the watchdog's teardown progress until the instance is gone.
+
+Between the steps, **interruption checkpoints** check whether a signal arrived and, if so, end the
+start with the normal deferred teardown: after `watchSignals`, after the trust gate, after the
+agent update, after `setupHost`, after the networks, and after each `compose up` (gateway, docker,
+agent). Without them a signal that reaches only the `hole` process during a slow step — where
+stopping the not-yet-existing agent container has no effect — would let the start carry on to a
+fully running sandbox. A signal to the whole process group (a terminal Ctrl-C, or the documented
+contract for programs that drive `hole start`) also aborts the running `compose`/build child, so
+the next checkpoint is reached at once; a process-only signal waits for that step to return.
+
+Right after the mask verification of the agent (and sidecar) the phase becomes `running`
+(`recordPhase`), before image GC, which can take seconds. The write takes the teardown lock
+**without waiting** and is skipped when the lock is busy or the instance is no longer registered:
+an agent that exits immediately is already being torn down by the watchdog, and writing the full
+struct then would re-create the state file of a destroyed sandbox, while waiting for the lock
+would make `attach` find the container gone and lose the agent's exit code.
 
 The exit code the CLI reports comes from the agent *container*, not from the attach client,
 whenever the container has already stopped. An agent whose command finishes before the attach
@@ -235,8 +265,18 @@ whole output when the failure is outside a hook — and `start.go` then skips
 
 `~/.hole/instances/<instance>.json` records everything teardown, `hole list` and GC need:
 identity, flags, the merged settings snapshot, both process IDs, networks and subnets, the DinD
-volume, the run directory and log file, and the start time. Writes are atomic (temp file +
-rename) so a reader never sees half a file.
+volume, the run directory and log file, the start time, and the lifecycle `phase` (`starting`,
+then `running`; absent in files of older versions). Writes are atomic (temp file + rename) so a
+reader never sees half a file.
+
+Next to it live small sidecar files: `.alive` (the liveness lock), `.lock` (the teardown lock),
+`.abort` (the CLI asks the watchdog to tear down now) and `.stopping`. **Stopping is a marker, not
+a phase value**: the CLI's signal goroutine must record it, but the main goroutine owns the
+`state.Instance` struct and rewrites it whole on every `store.Write`, so writing `stopping` into
+the JSON from the goroutine would be a data race and the next write would revert it. The marker is
+created under the teardown lock and only while the state file exists, and `store.Remove` deletes
+it, so it can never outlive the instance. `hole list --json` reports `stopping` when the marker
+exists, whatever the phase says.
 
 Docker labels (`hole.managed`, `hole.instance`, `hole.project`) remain the ground truth for what
 exists; the state file is the metadata cache. Its real job is letting GC distinguish an
@@ -298,7 +338,9 @@ One shared function (`sandbox.Teardown`) drives all three callers: watchdog, CLI
 for abandoned instances. It is guarded by a per-instance `flock` — a reentrancy guard, not a
 coordination mechanism; whoever loses the race finds the instance already deregistered — and
 works entirely from the state file, which it re-reads after locking, because a supervisor that
-started earlier holds a snapshot with no networks in it.
+started earlier holds a snapshot with no networks in it. Its first act under the lock is dropping
+the `.stopping` marker, before any slow step, so a caller polling `hole list --json` sees
+`stopping` within a poll interval whichever path tears down.
 
 Phases: prestart hook logs → `-n` dump → `compose down --remove-orphans` (fileless, `-p` only, so teardown never
 depends on generated files) → registry mirror detach → explicit removal of both networks with an
@@ -320,13 +362,15 @@ version's "cleanup seems random" symptom: `compose down` only ran when the final
 had succeeded, so an earlier failure leaked containers, and the network removal then failed
 invisibly because containers were still attached.
 
-Signals (INT/TERM/HUP) reach the CLI for the whole run, including the image build: they stop the
-agent container, which ends an active attach, let the interrupted step return, and set the exit
+Signals (INT/TERM/HUP) reach the CLI for the whole run, including the image build: they mark the
+instance stopping, stop the agent container, which ends an active attach, let the interrupted step
+return (the next [interruption checkpoint](#startup-sequence) ends the start), and set the exit
 code to the conventional 130/143/129.
 
 ### Garbage collection
 
-GC runs on every `start` and `list`. It is the backstop for the one case the watchdog cannot
+GC runs on every `start` and `list` (except `hole list --no-gc`, for callers that poll; it still
+filters abandoned instances out of its output). It is the backstop for the one case the watchdog cannot
 cover — CLI and watchdog killed at once — and it is deliberately conservative, because anything
 it removes might belong to a concurrent start:
 
@@ -343,6 +387,17 @@ it removes might belong to a concurrent start:
 Image GC is separate and runs only *after* the agent service is up — never before, or a failed
 build could have destroyed the last working image. See
 [configuration](configuration.md#image-identity-and-scope).
+
+## `hole list --json` is a public contract
+
+The JSON output is consumed by other programs (the JetBrains plugin first), which detect support
+by running it once and rely on its fields from then on. It is built from its own type,
+`sandbox.listEntry`, never by encoding `state.Instance`: the registry file is internal and can be
+refactored freely, the list schema cannot. Fields are only ever added, never renamed or removed.
+`status` is derived at listing time (`instanceStatus`: marker, then phase, legacy → `running`),
+`settings` is the slice the table joins with `+` (a path can contain `+`, so it is never split
+from a string), and `networks`/`settingsFiles` are `[]`, never `null`. Logging goes to stderr, so
+stdout carries only the document, encoded completely before anything is written.
 
 ## Destroy
 

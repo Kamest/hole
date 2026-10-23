@@ -84,6 +84,7 @@ Run without a terminal — from a script, a CI job, or with the output piped —
 | `--with-docker` | Enable the Docker-in-Docker sidecar |
 | `--trust-project` | Accept whatever the project's own settings ask for beyond the sandbox — host access and network widening alike — without being asked, and remember it; see [project trust](#project-trust) |
 | `--library PATH[:MOUNT][:rw]` | Mount an extra directory (repeatable); mounted at its own host path unless `MOUNT` is given, read-only unless `:rw` |
+| `--instance-id ID` | Use this instance ID instead of a random one: exactly 6 characters `a-z`, `0-9`. It must not belong to another running sandbox, in any project; a start that is rejected for that reason (or for a bad format) exits non-zero and creates nothing. Meant for tools that start Hole and then query it with [`hole list --json ID`](#machine-readable-list) |
 | `--` | Everything after this is passed verbatim to the agent CLI |
 
 `-r` is only needed to refresh *versions* (latest apt packages, latest agent CLIs). Changing a
@@ -166,6 +167,9 @@ Arguments after `--` reach the agent exactly as you typed them. `-d` cannot be c
 
 ```sh
 hole list                      # show running sandboxes
+hole list r8tq2c               # show one sandbox by instance ID
+hole list --json [ID]          # the same as JSON, for tools
+hole list --json --no-gc ID    # JSON without cleaning up leftovers, for tools that poll
 hole destroy                   # destroy ALL Hole Docker resources
 hole destroy .                 # destroy resources for the current project
 hole destroy /path/to/project  # destroy resources for a specific project
@@ -176,6 +180,76 @@ hole help                      # usage
 ```
 
 `hole list` shows the instance ID, agent (and profile), project path, uptime, whether Docker-in-Docker is enabled, the sandbox network, and which settings files were merged — the global one by path, e.g. `global(~/.hole/settings.json)+project`, so a sandbox started with [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file) shows which file it runs with. A [`HOLE_PROJECT_SETTINGS_FILE`](#alternative-project-settings-file) override is named by path too, e.g. `project(/path/to/project-settings.json)`; the in-repo file stays plain `project`.
+
+`hole list` also cleans up what dead sandboxes left behind, which costs a handful of container runtime calls. `--no-gc` skips that cleanup. The output stays correct: a dead sandbox is never listed, it is only not cleaned up by that call. Cleanup still happens on every `hole start` and every plain `hole list`.
+
+With an instance ID, `hole list` shows only that sandbox; when it is not running, the table mode says so and JSON mode prints `[]`. A malformed ID is an error.
+
+#### Machine-readable list
+
+`hole list --json` prints a JSON array to stdout, one object per running sandbox, and nothing else: log lines (including cleanup messages) go to stderr. With nothing running, or an ID that is not running, it prints `[]` and exits `0`. An error — no container runtime, an unreadable registry — prints a message on stderr, nothing on stdout, and exits non-zero.
+
+```json
+[
+  {
+    "instanceId": "r8tq2c",
+    "instanceName": "hole-sandbox-edeecms-1a2b3c4d-r8tq2c",
+    "status": "running",
+    "agent": "claude",
+    "profile": "research",
+    "projectPath": "/Users/me/projects/edeecms",
+    "projectName": "edeecms-1a2b3c4d",
+    "startedAt": "2026-10-21T10:14:03+02:00",
+    "uptimeSeconds": 754,
+    "docker": false,
+    "networks": ["hole-sandbox-edeecms-1a2b3c4d-r8tq2c_sandbox", "hole-sandbox-edeecms-1a2b3c4d-r8tq2c_internet"],
+    "settings": ["global(~/.hole/settings.json)", "project"],
+    "settingsFiles": ["/Users/me/.hole/settings.json", "/Users/me/projects/edeecms/.hole/settings.json"],
+    "flags": {
+      "debug": false,
+      "rebuild": false,
+      "unrestricted": false,
+      "dumpNetworkAccess": false,
+      "withDocker": false
+    },
+    "pid": 48211,
+    "version": "2.3.0"
+  }
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `instanceId`, `instanceName` | The 6-character ID, and the name Docker resources are prefixed with |
+| `status` | `starting`, `running` or `stopping`, see below |
+| `agent`, `profile` | The agent, and the profile (`""` when none — never omitted) |
+| `projectPath`, `projectName` | The project directory, and the name Hole derives from it |
+| `startedAt`, `uptimeSeconds` | Start time (RFC 3339 with offset), and seconds since then |
+| `docker` | Docker-in-Docker is enabled. It is set once the sidecar's volume exists, so it can read `false` while `starting` and turn `true` later |
+| `networks` | The sandbox's networks, `[]` when none exist yet — never `null` |
+| `settings` | The labels of the merged settings files, as in the table's SETTINGS column; `["defaults"]` when no file contributed |
+| `settingsFiles` | Absolute paths of the merged settings files, `[]` when none |
+| `flags` | The flags the sandbox was started with |
+| `pid` | PID of the `hole start` process — the one to signal to stop the sandbox |
+| `version` | The Hole version that started the sandbox |
+
+Fields are stable: new ones may be added, existing ones are never renamed or removed.
+
+`status` is `starting` from the moment the sandbox is registered until the agent container is up, then `running`. It becomes `stopping` when `hole start` receives SIGINT, SIGTERM or SIGHUP, or when teardown begins for any other reason (the agent exited, the watchdog or a cleanup took over); a sandbox that is torn down drops out of the list. A sandbox started by a Hole version without this field reports `running`. `status` is defined only by `hole list --json`: the files under `~/.hole/instances/` are not a contract and never contain `stopping`.
+
+Tools that poll should use `--no-gc`, so a poll every second does not keep the container runtime busy with cleanup.
+
+#### Stopping a sandbox from another program
+
+A program that runs `hole start` (an IDE plugin, for example) and wants to stop the sandbox must send SIGINT to `hole start`'s **process group**, the way a terminal's Ctrl-C does. Signalling only the `hole` process also tears the sandbox down, but if it arrives during an image build or a container start, the teardown waits until that step finishes, which can take minutes; the group signal stops the running step too.
+
+- Launch `hole start …` directly as the process of the pty, so that it leads its own process group. If a shell wrapper is unavoidable, it must `exec hole …`, so the PID stays the group leader.
+- Stop with `kill -INT -<pid>` (note the minus: the group), or the equivalent call of your platform. Check that a negative PID really reaches `kill(2)`.
+- Do not kill the process *tree*: that also signals Hole's teardown watchdog, which runs in its own session on purpose.
+- Do not write Ctrl-C (`0x03`) to the pty: once the terminal is attached to the agent it is in raw mode, and the byte reaches the agent as a keystroke instead of a signal.
+- After signalling, poll `hole list --json --no-gc <id>` (it reports `stopping`) until it prints `[]` and the process has exited.
+
+Closing the pty sends SIGHUP to the foreground process group, which Hole handles with the same teardown.
 
 ## Installation
 

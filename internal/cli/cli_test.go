@@ -223,14 +223,124 @@ func TestProfileIsRejectedForOtherCommands(t *testing.T) {
 	}
 }
 
-func TestListRejectsPositionalArguments(t *testing.T) {
+func TestListRejectsMalformedInstanceID(t *testing.T) {
 	if code := Run([]string{"list", "extra"}); code == 0 {
-		t.Error("hole list takes no arguments")
+		t.Error("hole list must reject a positional that is not an instance ID")
+	}
+}
+
+func TestListRejectsTwoPositionals(t *testing.T) {
+	if code := Run([]string{"list", "--json", "r8tq2c", "abc123"}); code == 0 {
+		t.Error("hole list takes at most one instance ID")
+	}
+}
+
+func TestParseInstanceIDForms(t *testing.T) {
+	for _, args := range [][]string{
+		{"start", "claude", ".", "--instance-id", "r8tq2c"},
+		{"start", "claude", ".", "--instance-id=r8tq2c"},
+		{"start", "--instance-id", "r8tq2c", "claude", "."},
+	} {
+		inv, err := Parse(args)
+		if err != nil {
+			t.Fatalf("Parse(%v): %v", args, err)
+		}
+		if inv.InstanceID != "r8tq2c" {
+			t.Errorf("Parse(%v).InstanceID = %q, want r8tq2c", args, inv.InstanceID)
+		}
+		if !reflect.DeepEqual(inv.Positional, []string{"claude", "."}) {
+			t.Errorf("Parse(%v).Positional = %v", args, inv.Positional)
+		}
+	}
+}
+
+func TestParseInstanceIDWithoutValueFails(t *testing.T) {
+	_, err := Parse([]string{"start", "claude", ".", "--instance-id"})
+	if err == nil || err.Error() != "--instance-id needs a value: 6 characters a-z, 0-9" {
+		t.Errorf("Parse error = %v", err)
+	}
+}
+
+func TestParseInstanceIDRejectsBadFormat(t *testing.T) {
+	for _, args := range [][]string{
+		{"start", "claude", ".", "--instance-id", "R8TQ2C"},
+		{"start", "claude", ".", "--instance-id=R8TQ2C"},
+	} {
+		_, err := Parse(args)
+		if err == nil || err.Error() != "invalid instance ID 'R8TQ2C': expected 6 characters a-z, 0-9" {
+			t.Errorf("Parse(%v) error = %v", args, err)
+		}
+	}
+}
+
+func TestParseInstanceIDTwiceLastWins(t *testing.T) {
+	inv, err := Parse([]string{"start", "claude", ".", "--instance-id", "aaaaaa", "--instance-id=bbbbbb"})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if inv.InstanceID != "bbbbbb" {
+		t.Errorf("InstanceID = %q, want bbbbbb", inv.InstanceID)
+	}
+}
+
+func TestParseInstanceIDAfterSeparatorBelongsToTheAgent(t *testing.T) {
+	inv, err := Parse([]string{"start", "claude", ".", "--", "--instance-id", "x", "--json", "--no-gc"})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if inv.InstanceID != "" || inv.JSON || inv.NoGC {
+		t.Errorf("flags after -- were parsed by hole: %+v", inv)
+	}
+}
+
+func TestInstanceIDIsRejectedForOtherCommands(t *testing.T) {
+	for _, args := range [][]string{
+		{"list", "--instance-id", "r8tq2c"},
+		{"destroy", "--instance-id", "r8tq2c"},
+	} {
+		if code := Run(args); code == 0 {
+			t.Errorf("%v should have been rejected", args)
+		}
+	}
+}
+
+func TestParseJSONAndNoGC(t *testing.T) {
+	inv, err := Parse([]string{"list", "--json", "--no-gc", "r8tq2c"})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !inv.JSON || !inv.NoGC {
+		t.Errorf("JSON = %v, NoGC = %v, want both true", inv.JSON, inv.NoGC)
+	}
+	if !reflect.DeepEqual(inv.Positional, []string{"r8tq2c"}) {
+		t.Errorf("positional = %v", inv.Positional)
+	}
+}
+
+func TestJSONIsRejectedForOtherCommands(t *testing.T) {
+	for _, args := range [][]string{
+		{"start", "claude", ".", "--json"},
+		{"destroy", "--json"},
+	} {
+		if code := Run(args); code == 0 {
+			t.Errorf("%v should have been rejected", args)
+		}
+	}
+}
+
+func TestNoGCIsRejectedForOtherCommands(t *testing.T) {
+	for _, args := range [][]string{
+		{"start", "claude", ".", "--no-gc"},
+		{"destroy", "--no-gc"},
+	} {
+		if code := Run(args); code == 0 {
+			t.Errorf("%v should have been rejected", args)
+		}
 	}
 }
 
 func TestHelpDocumentsProfilesAndList(t *testing.T) {
-	for _, want := range []string{"{agent}[:{profile}]", "hole list", "profiles"} {
+	for _, want := range []string{"{agent}[:{profile}]", "hole list", "profiles", "--instance-id", "--json", "--no-gc"} {
 		if !strings.Contains(helpText, want) {
 			t.Errorf("help text is missing %q", want)
 		}
