@@ -61,6 +61,7 @@ directory to keep in sync. See [guidelines](guidelines.md#non-negotiable-rules).
 | `~/.hole/agents/<name>/` | user-defined agents |
 | `~/.hole/instances/<instance>.json` | one file per running sandbox (plus its lock files) |
 | `~/.hole/logs/run-*.log` | per-run debug logs, ~7 day retention |
+| `~/.hole/logs/run-*/` | per-run hook logs and `build.log` ([hook logs](#hook-logs)), same retention |
 | `~/.hole/tmp/run.XXXXXX/` | per-run generated artifacts |
 | `~/.hole/state.json` | the last version that completed a run |
 | `~/.hole/trust.json` | project paths whose settings the user accepted, and what they accepted |
@@ -139,7 +140,9 @@ removed outright when it times out.
 8. Materialize the build contexts and gateway configuration; generate one compose file. Directory
    masks are generated as subpaths of the mask volume unless the compose plugin is older than
    2.26; the mask volume is created right after, and only when there is a directory to mask.
-9. `compose up -d` per service: gateway → docker (if enabled) → agent. Between the gateway and the
+9. `compose up -d` per service: gateway → docker (if enabled) → agent, each through a
+   [build stream](#hook-logs) that writes `build.log`, renders the build progress and splits out
+   the setup hooks' logs. Between the gateway and the
    next service, the mask volume's subpaths are prepared and one is probe-mounted over the gateway
    image; if either fails, the volume is removed, a warning names the engine, and the compose file
    is regenerated with tmpfs masks (the gateway's definition is identical in both files, so compose
@@ -166,6 +169,65 @@ The exit code the CLI reports comes from the agent *container*, not from the att
 whenever the container has already stopped. An agent whose command finishes before the attach
 lands makes the runtime refuse with "cannot attach to a stopped container" and exit 1, which would
 otherwise turn a successful short-lived agent into a failed run.
+
+## Hook logs
+
+Every hook script gets one log file under `~/.hole/logs/<run log name without .log>/`
+(`hooks.RunLogDir`), named `<kind>-<NNN>-<name>.log` — `setup-host`, `build-setup`, `prestart`,
+`cleanup-host`. The format lives in `internal/hooks/hooklog.go`: a header (kind, script, start
+time, and Hole's hook variables only — never `os.Environ()`), the output, then `duration:` and a
+fixed trailer as the last line (`exit code: N`, `killed by signal: SIGTERM`, `exit code: unknown
+(<reason>)`, `not run: <error>`). The directory is `0700` and the files `0600`: hook output can
+carry tokens. It is never the project's `.hole/logs` — that is inside the sandbox's read-write
+mount (the reasoning in `dump.go`). The watchdog finds the directory from
+`state.Instance.LogFile`. `LogFileGC` removes `run-<date>-<time>-*` directories with the run logs
+and leaves every other directory alone, since `~/.hole/logs/<project>/` holds the `-n` dumps.
+
+How each hook's output reaches its log:
+
+- **`setupHost`, `cleanupHost`** — `hooks.runScript` tees stdout and stderr (one writer, so their
+  order survives) to the console and the log, and reads the exit code or the killing signal from
+  the `WaitStatus`. The streams become pipes as a result, and `os/exec` would wait for every
+  holder of a pipe — including a background process the script left running — so `WaitDelay`
+  bounds that wait, and `exec.ErrWaitDelay` counts as the script's own successful exit.
+- **`setup`** — the logs are needed most when the build fails, and a failed build leaves no image,
+  so nothing can be read out of the image afterwards. The Dockerfile loop prints
+  `::hole-hook-begin setup <name>::` / `::hole-hook-end setup <name> exit=<rc>::` around every
+  script and exits on the first failing one. `engine.ComposeUp` takes an `io.Writer` (with
+  `BUILDKIT_PROGRESS=plain` in the environment) and `sandbox.buildStream` parses the stream:
+  BuildKit's `#N [service x/y]` headers map vertex ids to services (compose builds `depends_on`
+  services in the same call, and their vertices interleave), `#N <time> text` lines of the vertex
+  that printed a begin marker feed the hook's log with the prefix stripped. Buildah's `STEP x/y:`
+  and the legacy builder's `Step x/y :` lines carry no vertex id, so there every unmarked line is
+  candidate hook output. A script whose end marker never appeared is reported only once the
+  build's outcome is known: BuildKit clips a step's log at 2 MiB (`[output clipped …]`), losing
+  the marker of a script that may have succeeded.
+- **`prestart`** — the entrypoint prints the same markers and exits with the failing script's
+  code. Teardown reads the agent container's log *before* `compose down`
+  (`engine.ContainerLogLines` streams it and stops at the entrypoint's `Starting agent CLI...`
+  line, so the agent's TUI redraws are never read and nothing the agent prints can reach the
+  logs), strips ANSI sequences and collapses `\r` redraws (the container has a TTY), and splits it.
+  The scanner already drops overwritten redraws (`scanTerminalLines`), so a progress bar running
+  for minutes without a newline cannot outgrow its buffer. These logs carry no `duration:` — they
+  are written after the fact.
+  A read-write host mount for the logs was rejected: the agent runs right after and could rewrite
+  or symlink them.
+
+`hooks.Splitter` is shared by both marker-based kinds. It accepts only the names Hole itself put
+in the build context or prestart directory, so an echoed marker can neither invent a file name nor
+escape the directory; within those names the first begin and the last end marker count. Markers
+are forgeable by the scripts, which does not matter: the loop's exit status decides the build or
+the start, never a marker. A per-build nonce was rejected because it would invalidate the hook
+layer's cache on every build.
+
+The build stream also drives the console: `logging.BuildProgress` shows a single status line
+rewritten in place on a terminal (the console handler clears it before every record and redraws it
+after, under the same mutex), one line per step elsewhere, and a permanent line per finished setup
+hook. With `-d` or `HOLE_BUILD_PROGRESS=plain` it forwards the raw stream instead. On failure the
+stream reports the failing hook with its exit code, output tail and log path — or the tail of the
+whole output when the failure is outside a hook — and `start.go` then skips
+`reportServiceStartFailure` for that service, whose container does not exist. `ImageBuild`
+(`--update-agents`) still writes to the console directly.
 
 ## Reliability: registry, watchdog, GC
 
@@ -238,7 +300,7 @@ coordination mechanism; whoever loses the race finds the instance already deregi
 works entirely from the state file, which it re-reads after locking, because a supervisor that
 started earlier holds a snapshot with no networks in it.
 
-Phases: `-n` dump → `compose down --remove-orphans` (fileless, `-p` only, so teardown never
+Phases: prestart hook logs → `-n` dump → `compose down --remove-orphans` (fileless, `-p` only, so teardown never
 depends on generated files) → registry mirror detach → explicit removal of both networks with an
 attached-container force fallback → DinD volume → mask volume → registry mirror stop when this was the last
 instance → `cleanupHost` hooks → run directory → state file → a final verification pass that
@@ -275,7 +337,7 @@ it removes might belong to a concurrent start:
 | Containers | stopped sandbox containers whose instance has no state file, no running sibling and **no networks left** (compose has a window where networks exist but containers do not) |
 | Volumes | per-instance DinD and mask volumes whose instance has neither network nor container — volume prune has no age filter, so sibling liveness is the age proxy |
 | Run directories | `~/.hole/tmp/run.*` older than a day that no registered instance owns |
-| Run logs | older than 7 days |
+| Run logs | run log files and `run-<date>-<time>-*` hook log directories older than 7 days |
 | Update references | `hole-sandbox/agent-update:<instanceID>` and `:<instanceID>-base` whose instance ID is not in the registry — an update interrupted by a kill; skipped when the registry cannot be read |
 
 Image GC is separate and runs only *after* the agent service is up — never before, or a failed

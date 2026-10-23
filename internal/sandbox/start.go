@@ -203,6 +203,7 @@ func Start(opts Options) (exitCode int, err error) {
 		}
 	}
 	hookEnv := hookEnvironment(host, instance)
+	hookLogDir := hooks.RunLogDir(opts.LogFile)
 
 	policy, err := buildPolicy(settings, enabledAgents, opts.Unrestricted)
 	if err != nil {
@@ -286,7 +287,7 @@ func Start(opts Options) (exitCode int, err error) {
 		removeForRebuild(containerEngine, imageIdentity.Reference(), gatewayImage)
 	}
 
-	if err := hooks.RunSetupHost(hooks.Resolve(settings.Hooks.SetupHost, host, opts.ProjectDir, "setupHost"), hookEnv); err != nil {
+	if err := hooks.RunSetupHost(hooks.Resolve(settings.Hooks.SetupHost, host, opts.ProjectDir, "setupHost"), hookEnv, hookLogDir); err != nil {
 		return 1, err
 	}
 
@@ -413,9 +414,15 @@ func Start(opts Options) (exitCode int, err error) {
 		}
 	}
 
+	output := newComposeOutput(hookLogDir, opts.Debug || os.Getenv("HOLE_BUILD_PROGRESS") == "plain",
+		setupScriptFileNames(setupScripts))
+	defer output.close()
+
 	logging.Info("Starting network gateway...")
-	if err := containerEngine.ComposeUp(instanceName, composeFile, runTmpDir, opts.Rebuild, "gateway"); err != nil {
-		reportServiceStartFailure(containerEngine, instanceName, "gateway")
+	if buildFailed, err := output.up(containerEngine, instanceName, composeFile, runTmpDir, opts.Rebuild, "gateway"); err != nil {
+		if !buildFailed {
+			reportServiceStartFailure(containerEngine, instanceName, "gateway")
+		}
 		return 1, err
 	}
 
@@ -448,7 +455,7 @@ func Start(opts Options) (exitCode int, err error) {
 
 	if dockerEnabled {
 		logging.Info("Starting Docker-in-Docker sidecar...")
-		if err := containerEngine.ComposeUp(instanceName, composeFile, runTmpDir, opts.Rebuild, "docker"); err != nil {
+		if _, err := output.up(containerEngine, instanceName, composeFile, runTmpDir, opts.Rebuild, "docker"); err != nil {
 			// Both services wait on the gateway's healthcheck, so a failure here is more often
 			// the gateway's than the service's own — report it first, and report both.
 			reportServiceStartFailure(containerEngine, instanceName, "gateway")
@@ -459,9 +466,13 @@ func Start(opts Options) (exitCode int, err error) {
 
 	logging.Info("Starting %s agent...", opts.Agent)
 	logging.Line()
-	if err := containerEngine.ComposeUp(instanceName, composeFile, runTmpDir, opts.Rebuild, "agent"); err != nil {
-		reportServiceStartFailure(containerEngine, instanceName, "gateway")
-		reportServiceStartFailure(containerEngine, instanceName, "agent")
+	if buildFailed, err := output.up(containerEngine, instanceName, composeFile, runTmpDir, opts.Rebuild, "agent"); err != nil {
+		// A failed image build has already been reported from its own output, and there is no
+		// agent container whose logs could add anything.
+		if !buildFailed {
+			reportServiceStartFailure(containerEngine, instanceName, "gateway")
+			reportServiceStartFailure(containerEngine, instanceName, "agent")
+		}
 		return 1, err
 	}
 
@@ -889,20 +900,31 @@ func materializeBuildContext(runTmpDir string, enabledAgents []*agents.Agent, se
 	if err := os.WriteFile(filepath.Join(setupDir, ".gitkeep"), nil, 0o644); err != nil {
 		return "", fmt.Errorf("create setup script placeholder: %w", err)
 	}
+	names := setupScriptFileNames(setupScripts)
 	for i, script := range setupScripts {
 		content, err := script.Content()
 		if err != nil {
 			return "", err
 		}
-		name := fmt.Sprintf("%03d-%s", i+1, script.Name())
-		if !strings.HasSuffix(name, ".sh") {
-			name += ".sh"
-		}
-		if err := os.WriteFile(filepath.Join(setupDir, name), content, 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(setupDir, names[i]), content, 0o755); err != nil {
 			return "", fmt.Errorf("write setup script into build context: %w", err)
 		}
 	}
 	return contextDir, nil
+}
+
+// setupScriptFileNames are the names the setup scripts get in the build context, which the
+// build's loop runs them by: numbered in order and ending in `.sh`, the loop's glob.
+func setupScriptFileNames(setupScripts []hooks.Script) []string {
+	names := make([]string, 0, len(setupScripts))
+	for i, script := range setupScripts {
+		name := fmt.Sprintf("%03d-%s", i+1, script.Name())
+		if !strings.HasSuffix(name, ".sh") {
+			name += ".sh"
+		}
+		names = append(names, name)
+	}
+	return names
 }
 
 // materializePrestartScripts copies prestart hooks into the run directory with numbered

@@ -939,7 +939,7 @@ Configured arguments expand `$VAR` the same way `environment` values do. Argumen
 | Hook | Runs where | When | On failure |
 |---|---|---|---|
 | `hooks.setupHost` | host | before any Docker work | aborts startup (`cleanupHost` still runs) |
-| `hooks.setup` | container, during the image build | when the image is built | aborts the build |
+| `hooks.setup` | container, during the image build | when the image is built | aborts the build at the first failing script |
 | `hooks.prestart` | container | every start, before the agent CLI | aborts startup |
 | `hooks.cleanupHost` | host | during teardown | logged, teardown continues |
 
@@ -975,7 +975,54 @@ Sandboxes that Hole has already given up on (both their CLI and their watchdog a
 
 `hooks.setup` scripts are part of the image identity, so editing one rebuilds the image.
 
-> `cleanupHost` scripts normally run in Hole's detached teardown supervisor, which has **no TTY**. Their output goes to the run log; interactive scripts are not supported there.
+> `cleanupHost` scripts normally run in Hole's detached teardown supervisor, which has **no TTY**. Their output goes to the run log and to their own hook log; interactive scripts are not supported there.
+
+#### Hook logs
+
+Every hook script that runs gets its own log file with its complete output and, as the last line,
+how it ended — `exit code: 0`, `exit code: 3`, `killed by signal: SIGTERM`, or `exit code: unknown
+(…)` when its end was never seen. The files live next to the run log, in a directory of the same
+name (see [Logs](#logs)):
+
+```
+~/.hole/logs/run-20261019-101500-claude-4242/
+  setup-host-001-proxy.sh.log
+  build.log                          # full output of the image builds and compose
+  build-setup-001-node.sh.log
+  build-setup-002-java.sh.log
+  prestart-001-prestart.sh.log
+  cleanup-host-001-cleanup-host.sh.log
+```
+
+When a hook fails, Hole names the script, its exit code and the path of its log. The directory is
+readable only by you (hook output can contain tokens). Some things to know:
+
+- `setupHost` and `cleanupHost` output still reaches the console, but through a pipe: a script that
+  tests `[ -t 1 ]` no longer sees a terminal. A background process the script starts (an
+  `ssh-agent`, a `kubectl port-forward … &`) inherits that pipe; Hole stops waiting for it two
+  seconds after the script exits, and the process's later output is lost — redirect it to a file
+  if you need it.
+- Setup hooks get a log only when they actually run. When the image already exists or the build
+  step is cached, `build.log` says so instead.
+- The image builder truncates a step's output at 2 MiB (`BUILDKIT_STEP_LOG_MAX_SIZE`), so a very
+  chatty setup hook may lose its last lines and its exit code; its log then ends with `exit code:
+  unknown (…)` and Hole warns about it. Whether the build fails is still decided by the hook's real
+  exit code.
+- Prestart logs are read from the agent container when the sandbox is torn down, up to the moment
+  the agent CLI starts — nothing the agent prints reaches them. Colours and redrawn progress bars
+  are reduced to plain text. A container log driver that cannot be read back (`none`, `syslog`)
+  leaves no prestart logs.
+
+#### Image build progress
+
+While an image builds, Hole shows a compact progress line — the current step and setup hook, and
+the elapsed time — and a line per finished setup hook. Without a terminal (CI) it prints one line
+per build step instead. The raw build output always goes to `build.log`; to see it on the console
+as well, run with `-d`, or set `HOLE_BUILD_PROGRESS=plain` to keep everything else as it is:
+
+```bash
+HOLE_BUILD_PROGRESS=plain hole start claude . -r
+```
 
 ### Profiles
 
@@ -1103,6 +1150,7 @@ Then connect to `host.internal:5432` from inside the sandbox.
 | Path | Contents |
 |---|---|
 | `~/.hole/logs/run-<date>-<agent>-<pid>.log` | per-run debug log: every runtime command, timings, teardown detail (kept ~7 days) |
+| `~/.hole/logs/run-<date>-<agent>-<pid>/` | that run's [hook logs](#hook-logs) and `build.log` (kept ~7 days) |
 | `~/.hole/logs/<project>/network-access-<agent>-<id>.log` | the `-n` dump of resolved and refused domains |
 | `~/.hole/instances/` | one file per running sandbox, powering `hole list` |
 | `~/.hole/trust.json` | which projects' settings you accepted, see [project trust](#project-trust) |

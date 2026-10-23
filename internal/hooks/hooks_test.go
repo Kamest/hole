@@ -78,7 +78,7 @@ func TestResolveHandlesAbsentAndEmptyEntries(t *testing.T) {
 func TestRunSetupHostFailureAborts(t *testing.T) {
 	dir := t.TempDir()
 	failing := Script{Path: script(t, dir, "fail.sh", "#!/bin/bash\nexit 3\n")}
-	if err := RunSetupHost([]Script{failing}, nil); err == nil {
+	if err := RunSetupHost([]Script{failing}, nil, ""); err == nil {
 		t.Error("a failing setupHost hook must abort startup")
 	}
 }
@@ -88,7 +88,7 @@ func TestRunSetupHostPassesEnvironment(t *testing.T) {
 	marker := filepath.Join(dir, "marker")
 	checking := Script{Path: script(t, dir, "check.sh",
 		"#!/bin/bash\n[[ \"${HOLE_PROJECT_NAME}\" == \"demo\" ]] && touch \""+marker+"\"\n")}
-	if err := RunSetupHost([]Script{checking}, []string{"HOLE_PROJECT_NAME=demo"}); err != nil {
+	if err := RunSetupHost([]Script{checking}, []string{"HOLE_PROJECT_NAME=demo"}, ""); err != nil {
 		t.Fatalf("RunSetupHost: %v", err)
 	}
 	if _, err := os.Stat(marker); err != nil {
@@ -104,7 +104,7 @@ func TestRunCleanupHostContinuesAfterFailure(t *testing.T) {
 		{Path: script(t, dir, "two.sh", "#!/bin/bash\ntouch \""+marker+"\"\n")},
 	}
 	// Teardown never aborts: a failing cleanup hook must not stop the remaining ones.
-	RunCleanupHost(scripts, nil)
+	RunCleanupHost(scripts, nil, "")
 	if _, err := os.Stat(marker); err != nil {
 		t.Error("teardown stopped after a failing cleanupHost hook")
 	}

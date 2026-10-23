@@ -391,6 +391,18 @@ else was ever written into `<project>/.hole/`, so if you added `.hole/logs/` to 
 **New: `hole list`** shows what is running, and per-run debug logs are written to
 `~/.hole/logs/`.
 
+**A failing setup hook now always fails the image build.** 1.x — and 2.0 before this release —
+ran the `hooks.setup` scripts in a loop whose status was only that of the last script, so a failing
+`001-` script followed by a succeeding `002-` one produced a green build with a broken image. The
+build now stops at the first failing script, and the scripts after it do not run. The same applies
+to the agents' install scripts. Expect a build that used to "succeed" to fail now if one of your
+setup scripts has been failing unnoticed; its [hook log](README.md#hook-logs) shows why. Every
+image rebuilds once after the upgrade.
+
+**Image builds show a compact progress line.** The raw build output moved to the run's
+`build.log`; `-d` or `HOLE_BUILD_PROGRESS=plain` shows it on the console as before. See
+[image build progress](README.md#image-build-progress).
+
 ## Troubleshooting
 
 **"uses settings that were removed in Hole 2.0"** — this is the migration error. It names the

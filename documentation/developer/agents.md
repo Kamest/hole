@@ -210,9 +210,18 @@ agents' install scripts. Phase order in `assets/agents/Dockerfile`:
    Passwordless sudo.
 7. **User-phase agent installs**, with `BASH_ENV=~/.bash_env` set up so nvm-installed tools work
    in the non-interactive shells agents use.
-8. **Setup hooks** — `hooks.setup` scripts, copied in as `NNN-name.sh` and run in order.
+8. **Setup hooks** — `hooks.setup` scripts, copied in as `NNN-name.sh` and run in order, each
+   between `::hole-hook-begin`/`::hole-hook-end … exit=<rc>::` markers that Hole splits into
+   per-script logs ([architecture](architecture.md#hook-logs)).
 9. **Entrypoint** — `assets/agents/entrypoint.sh`: point the default route at the gateway, run
-   any mounted `/tmp/prestart-scripts/*` in order, then `exec` the agent command.
+   any mounted `/tmp/prestart-scripts/*` in order (with the same markers; the first failing script
+   ends the container with its exit code), then `exec` the agent command.
+
+The build `SHELL` is bash with `pipefail` but **without `-e`**, so a `for` loop's status is only
+that of its last iteration. Every loop over scripts (agent installs, setup hooks) therefore exits
+on a failing iteration itself (`|| exit $?`); without that, a failing script followed by a
+succeeding one gives a green build with a broken image. `hookloops_test.go` runs the loops
+straight out of the embedded Dockerfile to hold this.
 
 ## Container user identity
 

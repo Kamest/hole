@@ -50,6 +50,8 @@ func Teardown(containerEngine *engine.Engine, host hostenv.Host, store *state.St
 	// claim a session for a startup that failed before the agent ever ran.
 	agentRan := containerEngine.ContainerStarted(instance.InstanceName + "-agent-1")
 
+	writePrestartLogs(containerEngine, instance)
+
 	if instance.Flags.DumpNetworkAccess && containerEngine.ContainerExists(instance.InstanceName+"-gateway-1") {
 		writeNetworkAccessDump(containerEngine, host, instance)
 	}
@@ -175,7 +177,7 @@ func runCleanupHostHooks(host hostenv.Host, instance *state.Instance, lastInstan
 		return
 	}
 	scripts := hooks.Resolve(settings.Hooks.CleanupHost, host, instance.ProjectPath, "cleanupHost")
-	hooks.RunCleanupHost(scripts, cleanupHookEnvironment(host, instance, lastInstance))
+	hooks.RunCleanupHost(scripts, cleanupHookEnvironment(host, instance, lastInstance), hooks.RunLogDir(instance.LogFile))
 }
 
 // verifyRemoved is the final check: anything still matching this instance is reported with

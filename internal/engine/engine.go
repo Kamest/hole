@@ -4,11 +4,13 @@
 package engine
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -85,10 +87,19 @@ func newEngine(binary string) (*Engine, error) {
 
 // run executes a runtime command, forwarding output to the console.
 func (e *Engine) run(args ...string) error {
+	return e.runTo(os.Stderr, nil, args...)
+}
+
+// runTo executes a runtime command with both output streams going to out and extraEnv added to
+// the environment. A single writer keeps the two streams in the order they were written.
+func (e *Engine) runTo(out io.Writer, extraEnv []string, args ...string) error {
 	start := time.Now()
 	cmd := exec.Command(e.Binary, args...)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	err := cmd.Run()
 	logging.Debug("engine: %s %s (%s)", e.Binary, strings.Join(args, " "), time.Since(start).Round(time.Millisecond))
 	if err != nil {
@@ -127,14 +138,22 @@ func (e *Engine) Exec(container string, args ...string) (string, error) {
 	return e.output(append([]string{"exec", container}, args...)...)
 }
 
-// ComposeUp starts services from a generated compose file.
-func (e *Engine) ComposeUp(project, file, projectDir string, build bool, services ...string) error {
+// ComposeUp starts services from a generated compose file, writing compose's output (image
+// builds included) to out, or to the console when out is nil.
+//
+// A writer that is not the console gets BuildKit's plain progress: it is what a pipe falls back
+// to anyway, and the env var is harmless where it is not understood (podman), unlike a
+// `--progress` flag some compose implementations reject.
+func (e *Engine) ComposeUp(out io.Writer, project, file, projectDir string, build bool, services ...string) error {
 	args := []string{"compose", "-p", project, "--project-directory", projectDir, "-f", file, "up", "-d"}
 	if build {
 		args = append(args, "--build")
 	}
 	args = append(args, services...)
-	return e.run(args...)
+	if out == nil {
+		return e.run(args...)
+	}
+	return e.runTo(out, []string{"BUILDKIT_PROGRESS=plain"}, args...)
 }
 
 // ComposeDown tears a project down without needing the compose file: compose v2 resolves
@@ -779,6 +798,78 @@ func (e *Engine) ContainerLogs(name string) (string, error) {
 	cmd.Stderr = &buf
 	err := cmd.Run()
 	return buf.String(), err
+}
+
+// ContainerLogLines streams a container's combined log line by line, without line endings,
+// until consume returns false or the log ends. Streaming rather than reading the whole log
+// matters for the agent container: an interactive agent's terminal redraws can make it huge,
+// while the caller only needs its beginning.
+func (e *Engine) ContainerLogLines(name string, consume func(line string) bool) error {
+	start := time.Now()
+	reader, writer := io.Pipe()
+	cmd := exec.Command(e.Binary, "logs", name)
+	cmd.Stdout = writer
+	cmd.Stderr = writer
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("%s logs %s: %w", e.Binary, name, err)
+	}
+	waited := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		_ = writer.CloseWithError(err)
+		waited <- err
+	}()
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner.Split(scanTerminalLines)
+	stopped := false
+	for scanner.Scan() {
+		if !consume(strings.TrimSuffix(scanner.Text(), "\r")) {
+			stopped = true
+			break
+		}
+	}
+	scanErr := scanner.Err()
+	if stopped || scanErr != nil {
+		_ = cmd.Process.Kill()
+	}
+	// Unblocks the copy into the pipe so Wait can return after an early stop.
+	_ = reader.Close()
+	err := <-waited
+	logging.Debug("engine: %s logs %s (%s)", e.Binary, name, time.Since(start).Round(time.Millisecond))
+	switch {
+	case stopped:
+		return nil
+	case scanErr != nil:
+		return fmt.Errorf("%s logs %s: %w", e.Binary, name, scanErr)
+	case err != nil:
+		return fmt.Errorf("%s logs %s: %w", e.Binary, name, err)
+	}
+	return nil
+}
+
+// scanTerminalLines splits like bufio.ScanLines, except that a line redrawn with `\r` (a progress
+// bar on a TTY) drops what it overwrote as it goes, so a redraw that runs for minutes without a
+// newline never grows past the scanner's buffer.
+func scanTerminalLines(data []byte, atEOF bool) (int, []byte, error) {
+	newline := bytes.IndexByte(data, '\n')
+	lineEnd := len(data)
+	if newline >= 0 {
+		lineEnd = newline
+	}
+	// Carriage returns ending the line are line endings (a TTY turns `\n` into `\r\n`), not redraws.
+	content := bytes.TrimRight(data[:lineEnd], "\r")
+	if redraw := bytes.LastIndexByte(content, '\r'); redraw >= 0 {
+		return redraw + 1, nil, nil
+	}
+	if newline >= 0 {
+		return newline + 1, data[:newline], nil
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 // ContainerInfo is the subset of container metadata GC and `hole list` need.

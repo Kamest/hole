@@ -539,3 +539,59 @@ func TestImageUntagWhileAContainerUsesTheImage(t *testing.T) {
 		t.Error("untagging stopped the container using the image")
 	}
 }
+
+func TestContainerLogLines(t *testing.T) {
+	engine := testEngine(t)
+	if err := engine.RunQuiet("pull", "alpine:3.19"); err != nil {
+		t.Skipf("could not pull alpine: %v", err)
+	}
+	tests := []struct {
+		name     string
+		runFlags []string
+	}{
+		{name: "plain"},
+		// A TTY container's log ends lines in \r\n.
+		{name: "tty", runFlags: []string{"-t"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			container := testLabelValue + "-loglines-" + test.name
+			_ = engine.ContainerRemove(container)
+			t.Cleanup(func() { _ = engine.ContainerRemove(container) })
+			args := append([]string{"run", "-d"}, test.runFlags...)
+			args = append(args, "--name", container, "alpine:3.19", "sh", "-c", "echo one; echo two; echo three")
+			if err := engine.RunQuiet(args...); err != nil {
+				t.Skipf("could not start a container: %v", err)
+			}
+			if _, err := engine.ContainerWait(container); err != nil {
+				t.Fatal(err)
+			}
+
+			var all []string
+			if err := engine.ContainerLogLines(container, func(line string) bool {
+				all = append(all, line)
+				return true
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(all, "|") != "one|two|three" {
+				t.Errorf("lines = %q", all)
+			}
+
+			var head []string
+			if err := engine.ContainerLogLines(container, func(line string) bool {
+				head = append(head, line)
+				return line != "two"
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(head, "|") != "one|two" {
+				t.Errorf("an early stop must end the stream there, got %q", head)
+			}
+		})
+	}
+
+	if err := engine.ContainerLogLines(testLabelValue+"-no-such-container", func(string) bool { return true }); err == nil {
+		t.Error("reading the log of a missing container must fail")
+	}
+}

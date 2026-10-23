@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"bufio"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -137,5 +139,28 @@ func TestParseBuilder(t *testing.T) {
 
 	if _, err := parseBuilder("ERROR: no builder\n"); err == nil {
 		t.Error("output without a driver was accepted")
+	}
+}
+
+func TestScanTerminalLines(t *testing.T) {
+	input := "plain\r\nbar 10%\rbar 50%\rbar done\r\nprinted with a trailing return\r\r\nlast"
+	scanner := bufio.NewScanner(strings.NewReader(input))
+	scanner.Split(scanTerminalLines)
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	want := []string{"plain\r", "bar done\r", "printed with a trailing return\r\r", "last"}
+	if strings.Join(lines, "|") != strings.Join(want, "|") {
+		t.Errorf("lines = %q, want %q", lines, want)
+	}
+
+	// A redraw that never ends its line must not outgrow a small buffer.
+	long := strings.Repeat(strings.Repeat("x", 100)+"\r", 1000) + "final\n"
+	scanner = bufio.NewScanner(strings.NewReader(long))
+	scanner.Buffer(make([]byte, 0, 256), 1024)
+	scanner.Split(scanTerminalLines)
+	if !scanner.Scan() || scanner.Text() != "final" {
+		t.Errorf("token = %q, err = %v", scanner.Text(), scanner.Err())
 	}
 }

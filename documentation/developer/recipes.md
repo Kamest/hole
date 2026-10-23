@@ -73,6 +73,8 @@ cached images automatically.
 ```sh
 ./hole start claude . -d                      # shell inside the sandbox
 cat ~/.hole/logs/run-*.log | tail -50         # every runtime command, with timings
+tail -n1 ~/.hole/logs/run-*/*.log             # how every hook script of each run ended
+HOLE_BUILD_PROGRESS=plain ./hole start claude . -r   # raw image build output on the console
 hole list                                     # what is still running
 ```
 

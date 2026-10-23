@@ -9,13 +9,20 @@ if [[ -n "${HOLE_GATEWAY_IP:-}" ]]; then
   fi
 fi
 
-# Execute prestart hook scripts (if any are mounted)
+# Execute prestart hook scripts (if any are mounted). The markers let Hole extract one log per
+# script from the container log; the first failing script ends the container with its code.
 if [[ -d /tmp/prestart-scripts ]]; then
   for script in /tmp/prestart-scripts/*; do
     [[ -f "${script}" ]] || continue
     [[ "${script}" == *.gitkeep ]] && continue
-    echo "Running prestart hook: $(basename "${script}")..."
+    name="$(basename "${script}")"
+    echo "::hole-hook-begin prestart ${name}::"
+    set +e
     "${script}"
+    rc=$?
+    set -e
+    echo "::hole-hook-end prestart ${name} exit=${rc}::"
+    [[ "${rc}" -eq 0 ]] || exit "${rc}"
   done
 fi
 
