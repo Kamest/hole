@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -839,4 +840,222 @@ func TestListShowsRunningSandbox(t *testing.T) {
 			t.Errorf("hole list output is missing %q:\n%s", want, output)
 		}
 	}
+}
+
+// runHoleStdout runs hole with stdout and stderr kept apart, for commands whose stdout is a
+// machine-readable document.
+func runHoleStdout(t *testing.T, home string, timeout time.Duration, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	cmd := exec.Command(holeBinary, args...)
+	cmd.Env = holeEnv(home)
+	var stdoutBuilder, stderrBuilder strings.Builder
+	cmd.Stdout = &stdoutBuilder
+	cmd.Stderr = &stderrBuilder
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start hole %v: %v", args, err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			var exitErr *exec.ExitError
+			if !asExitError(err, &exitErr) {
+				t.Fatalf("running hole %v: %v\n%s", args, err, stderrBuilder.String())
+			}
+			code = exitErr.ExitCode()
+		}
+	case <-time.After(timeout):
+		_ = cmd.Process.Kill()
+		t.Fatalf("hole %v timed out\n%s", args, stderrBuilder.String())
+	}
+	return stdoutBuilder.String(), stderrBuilder.String(), code
+}
+
+// listEntry is the subset of the `hole list --json` contract the tests read.
+type listEntry struct {
+	InstanceID   string `json:"instanceId"`
+	InstanceName string `json:"instanceName"`
+	Status       string `json:"status"`
+	Agent        string `json:"agent"`
+	ProjectPath  string `json:"projectPath"`
+}
+
+// listJSON runs `hole list --json` with extra arguments and parses its stdout, which must be
+// pure JSON.
+func listJSON(t *testing.T, home string, args ...string) []listEntry {
+	t.Helper()
+	stdout, stderr, code := runHoleStdout(t, home, 5*time.Minute, append([]string{"list", "--json"}, args...)...)
+	if code != 0 {
+		t.Fatalf("hole list --json %v exited with %d:\n%s", args, code, stderr)
+	}
+	var entries []listEntry
+	if err := json.Unmarshal([]byte(stdout), &entries); err != nil {
+		t.Fatalf("hole list --json stdout is not JSON: %v\n%s", err, stdout)
+	}
+	if entries == nil {
+		t.Fatalf("hole list --json printed null instead of an array: %q", stdout)
+	}
+	return entries
+}
+
+func TestStartWithInstanceIDAndListJSON(t *testing.T) {
+	home, projectDir := environment(t, longRunningAgent, "")
+	cmd, instanceName := startInBackground(t, home, projectDir, "--instance-id", "e2e0id")
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(syscall.SIGINT)
+		_ = cmd.Wait()
+		waitGone(t, home, instanceName, 2*time.Minute)
+	})
+	if !strings.HasSuffix(instanceName, "-e2e0id") {
+		t.Fatalf("instance name %s does not carry the chosen ID", instanceName)
+	}
+
+	// The agent container runs a moment before the CLI records the running phase.
+	var entries []listEntry
+	deadline := time.Now().Add(time.Minute)
+	for {
+		entries = listJSON(t, home, "e2e0id")
+		if len(entries) == 1 && entries[0].Status == "running" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("hole list --json e2e0id returned %d entries, want 1", len(entries))
+	}
+	if entries[0].InstanceID != "e2e0id" || entries[0].InstanceName != instanceName ||
+		entries[0].Status != "running" || entries[0].ProjectPath != projectDir {
+		t.Errorf("entry = %+v", entries[0])
+	}
+
+	if stdout, _, code := runHoleStdout(t, home, 5*time.Minute, "list", "--json", "zzzzzz"); code != 0 || stdout != "[]\n" {
+		t.Errorf("unknown ID: exit %d, stdout %q, want 0 and []", code, stdout)
+	}
+
+	output, code := runHole(t, home, 2*time.Minute, "start", "test-agent", projectDir, "--instance-id", "e2e0id")
+	if code == 0 {
+		t.Errorf("a second start with the same instance ID succeeded:\n%s", output)
+	}
+	if !strings.Contains(output, "instance ID 'e2e0id' is already in use by "+projectDir) {
+		t.Errorf("the second start did not report the conflict:\n%s", output)
+	}
+	if states, _ := filepath.Glob(filepath.Join(home, ".hole", "instances", "*.json")); len(states) != 1 {
+		t.Errorf("registered instances after the rejected start = %v, want only %s", states, instanceName)
+	}
+}
+
+func TestStatusTransitions(t *testing.T) {
+	home, projectDir := environment(t, longRunningAgent, "")
+	const instanceID = "e2est1"
+	cmd := exec.Command(holeBinary, "start", "test-agent", projectDir, "--instance-id", instanceID)
+	cmd.Env = holeEnv(home)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start hole: %v", err)
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		<-exited
+	})
+
+	var seen []string
+	record := func(entries []listEntry) {
+		if len(entries) == 1 && (len(seen) == 0 || seen[len(seen)-1] != entries[0].Status) {
+			seen = append(seen, entries[0].Status)
+		}
+	}
+
+	deadline := time.Now().Add(20 * time.Minute)
+	for len(seen) == 0 || seen[len(seen)-1] != "running" {
+		if time.Now().After(deadline) {
+			t.Fatalf("the sandbox never reported running; statuses seen: %v", seen)
+		}
+		select {
+		case <-exited:
+			t.Fatalf("hole start exited before running; statuses seen: %v", seen)
+		default:
+		}
+		record(listJSON(t, home, instanceID))
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatalf("signal: %v", err)
+	}
+	deadline = time.Now().Add(3 * time.Minute)
+	for {
+		entries := listJSON(t, home, instanceID)
+		record(entries)
+		processDone := false
+		select {
+		case <-exited:
+			processDone = true
+		default:
+		}
+		if len(entries) == 0 && processDone {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the sandbox did not go away after SIGINT; statuses seen: %v", seen)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	want := []string{"starting", "running", "stopping"}
+	if !slices.Equal(seen, want) {
+		t.Errorf("statuses seen = %v, want %v", seen, want)
+	}
+	assertNoLeftovers(t, projectDir)
+}
+
+// A caller that stops a sandbox the moment it registers — closing an IDE tab right after
+// opening it — signals the process group, as documented for such callers. That must end in a
+// normal teardown, not a sandbox that carries on starting or one killed without cleanup.
+func TestEarlySIGINTEndsInTeardown(t *testing.T) {
+	home, projectDir := environment(t, longRunningAgent, "")
+	cmd := exec.Command(holeBinary, "start", "test-agent", projectDir)
+	cmd.Env = holeEnv(home)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start hole: %v", err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+
+	instanceName := ""
+	deadline := time.Now().Add(2 * time.Minute)
+	for instanceName == "" {
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			t.Fatal("hole start never registered an instance")
+		}
+		instanceName = runningInstance(t, home)
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGINT); err != nil {
+		t.Fatalf("signal process group: %v", err)
+	}
+
+	select {
+	case err := <-exited:
+		var exitErr *exec.ExitError
+		if !asExitError(err, &exitErr) || exitErr.ExitCode() != 130 {
+			t.Errorf("hole start exit = %v, want exit code 130", err)
+		}
+	case <-time.After(5 * time.Minute):
+		_ = cmd.Process.Kill()
+		t.Fatal("hole start did not exit after an early SIGINT")
+	}
+
+	waitGone(t, home, instanceName, 2*time.Minute)
+	assertNoLeftovers(t, projectDir)
 }

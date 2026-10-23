@@ -61,6 +61,9 @@ Two, both documented where they are implemented:
   (`hostenv.Host.ResolveHostPath` / `ResolveContainerPath`). Don't hand-roll path handling.
 - **Teardown and cleanup code never aborts**: best-effort, warnings only, and name every leftover
   it could not remove.
+- **`hole list --json` fields are a public contract** consumed by the JetBrains plugin; only add
+  fields, through `listEntry` (see
+  [architecture](architecture.md#hole-list---json-is-a-public-contract)).
 
 ## Documentation rules
 

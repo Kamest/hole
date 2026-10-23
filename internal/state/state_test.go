@@ -325,3 +325,78 @@ func TestLockPathIsDistinctFromStatePath(t *testing.T) {
 		t.Error("the lock file must not collide with the state file")
 	}
 }
+
+func TestPhaseRoundTripsAndLegacyFilesHaveNone(t *testing.T) {
+	s := store(t)
+	inst := instance("hole-sandbox-demo-1a2b3c4d-abc123")
+	inst.Phase = PhaseStarting
+	if err := s.Write(inst); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := s.Read(inst.InstanceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Phase != PhaseStarting {
+		t.Errorf("Phase = %q, want %q", loaded.Phase, PhaseStarting)
+	}
+
+	legacy := "hole-sandbox-demo-1a2b3c4d-legacy"
+	data := `{"instanceName":"` + legacy + `","instanceID":"legacy","agent":"claude","startedAt":"2026-01-01T00:00:00Z"}`
+	if err := os.WriteFile(s.Path(legacy), []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.Read(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Phase != "" {
+		t.Errorf("legacy Phase = %q, want empty", loaded.Phase)
+	}
+}
+
+func TestStoppingMarker(t *testing.T) {
+	s := store(t)
+	name := "hole-sandbox-demo-1a2b3c4d-abc123"
+	if s.Stopping(name) {
+		t.Error("instance is stopping before it was marked")
+	}
+	s.MarkStopping(name)
+	if !s.Stopping(name) {
+		t.Error("the stopping marker was not recorded")
+	}
+	s.Remove(name)
+	if s.Stopping(name) {
+		t.Error("the stopping marker survived Remove")
+	}
+}
+
+func TestClearMarkersKeepsLivenessAndState(t *testing.T) {
+	s := store(t)
+	inst := instance("hole-sandbox-demo-1a2b3c4d-abc123")
+	if err := s.Write(inst); err != nil {
+		t.Fatal(err)
+	}
+	release, err := s.HoldLiveness(inst.InstanceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	s.RequestTeardown(inst.InstanceName)
+	s.MarkStopping(inst.InstanceName)
+
+	s.ClearMarkers(inst.InstanceName)
+
+	if s.TeardownRequested(inst.InstanceName) || s.Stopping(inst.InstanceName) {
+		t.Error("ClearMarkers left a marker behind")
+	}
+	if !s.Exists(inst.InstanceName) {
+		t.Error("ClearMarkers removed the state file")
+	}
+	if _, err := os.Stat(s.LivenessPath(inst.InstanceName)); err != nil {
+		t.Errorf("ClearMarkers removed the liveness file: %v", err)
+	}
+	if s.CLIGone(inst.InstanceName) {
+		t.Error("the liveness lock is no longer held after ClearMarkers")
+	}
+}

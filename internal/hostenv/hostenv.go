@@ -281,6 +281,18 @@ func InstanceID() (string, error) {
 	return string(out), nil
 }
 
+// ValidateInstanceID checks a caller-chosen instance ID against the format InstanceID generates.
+func ValidateInstanceID(id string) error {
+	valid := len(id) == instanceIDLength
+	for i := 0; valid && i < len(id); i++ {
+		valid = strings.IndexByte(instanceIDAlphabet, id[i]) >= 0
+	}
+	if !valid {
+		return fmt.Errorf("invalid instance ID '%s': expected %d characters a-z, 0-9", id, instanceIDLength)
+	}
+	return nil
+}
+
 // InstanceName is the compose project name and resource prefix for one sandbox run.
 func InstanceName(projectName, instanceID string) string {
 	return "hole-sandbox-" + projectName + "-" + instanceID

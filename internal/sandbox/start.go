@@ -58,7 +58,17 @@ type Options struct {
 	AgentArgs []string
 	// LogFile is the run log the watchdog appends to and the CLI relays from.
 	LogFile string
+	// InstanceID is a caller-chosen instance ID, already format-validated; empty means generate
+	// one.
+	InstanceID string
 }
+
+// errInterrupted ends a start that a signal interrupted before the agent container was up.
+var errInterrupted = errors.New("interrupted, sandbox not started")
+
+// errInterruptedBeforeAttach ends a start that a signal interrupted after the agent container
+// came up but before the terminal was attached.
+var errInterruptedBeforeAttach = errors.New("interrupted before attaching to the agent, destroying sandbox")
 
 // Start creates the sandbox, attaches the terminal to the agent and tears everything down
 // when the agent exits. It returns the exit code the CLI should use.
@@ -72,15 +82,22 @@ func Start(opts Options) (exitCode int, err error) {
 			exitCode = int(code)
 		}
 	}()
+	// Registered first, so a signal from here on is buffered for watchSignals instead of killing
+	// the process with nothing cleaned up.
+	signals := notifySignals()
+	interrupted := func() bool { return signalled.Load() != 0 }
 
 	host := hostenv.DetectHost()
 	if err := host.ValidateSettingsFile(); err != nil {
 		return 1, err
 	}
 	projectName := hostenv.ProjectName(opts.ProjectDir)
-	instanceID, err := hostenv.InstanceID()
-	if err != nil {
-		return 1, err
+	instanceID := opts.InstanceID
+	if instanceID == "" {
+		var err error
+		if instanceID, err = hostenv.InstanceID(); err != nil {
+			return 1, err
+		}
 	}
 
 	instanceName := hostenv.InstanceName(projectName, instanceID)
@@ -90,12 +107,35 @@ func Start(opts Options) (exitCode int, err error) {
 		return 1, err
 	}
 
-	runTmpDir, err := host.CreateRunTmpDir()
+	store, err := state.NewStore(host.InstancesDir())
 	if err != nil {
 		return 1, err
 	}
+	if opts.InstanceID != "" {
+		if err := claimInstanceID(store, instanceID, instanceName); err != nil {
+			return 1, err
+		}
+	}
 
-	store, err := state.NewStore(host.InstancesDir())
+	// Held for the whole run: it is how the watchdog and GC tell a live CLI from one that has
+	// exited but not yet been reaped. Taken before the first registry write, because a state file
+	// without a held lock and without a watchdog is abandoned to a concurrent GC. For a
+	// caller-chosen ID the lock is also the real guard against a twin start in the same project:
+	// claimInstanceID cannot see one that holds the lock but has not written its state yet, and
+	// taking it before the run temp directory keeps that rejection free of leftovers.
+	releaseLiveness, err := store.HoldLiveness(instanceName)
+	if err != nil {
+		if opts.InstanceID != "" && errors.Is(err, syscall.EWOULDBLOCK) {
+			return 1, fmt.Errorf("instance ID '%s' is already in use by %s", instanceID, opts.ProjectDir)
+		}
+		return 1, err
+	}
+	defer releaseLiveness()
+	// Markers a previous run with the same instance name left behind would tear down or mislabel
+	// this one.
+	store.ClearMarkers(instanceName)
+
+	runTmpDir, err := host.CreateRunTmpDir()
 	if err != nil {
 		return 1, err
 	}
@@ -119,6 +159,7 @@ func Start(opts Options) (exitCode int, err error) {
 		LogFile:   opts.LogFile,
 		StartedAt: time.Now(),
 		Version:   version.Version,
+		Phase:     state.PhaseStarting,
 	}
 
 	// Registered before any Docker resource exists, so even a startup that aborts in the
@@ -126,17 +167,13 @@ func Start(opts Options) (exitCode int, err error) {
 	if err := store.Write(instance); err != nil {
 		return 1, err
 	}
-	// Held for the whole run: it is how the watchdog and GC tell a live CLI from one that has
-	// exited but not yet been reaped.
-	releaseLiveness, err := store.HoldLiveness(instanceName)
-	if err != nil {
-		return 1, err
-	}
-	defer releaseLiveness()
 
 	supervisor := startWatchdog(store, instance)
 	defer finishTeardown(containerEngine, host, store, instance, supervisor)
-	watchSignals(containerEngine, instance, signalled)
+	watchSignals(signals, containerEngine, store, instanceName, signalled)
+	if interrupted() {
+		return 1, errInterrupted
+	}
 
 	documents, err := loadSettingsDocument(host, opts.ProjectDir, opts.Profile)
 	if err != nil {
@@ -165,6 +202,9 @@ func Start(opts Options) (exitCode int, err error) {
 		Out:          os.Stderr,
 	}); err != nil {
 		return 1, err
+	}
+	if interrupted() {
+		return 1, errInterrupted
 	}
 
 	gitLayout := worktree.Derive(opts.ProjectDir, worktreeMode(settings), settings.Git.WorktreePool)
@@ -264,14 +304,14 @@ func Start(opts Options) (exitCode int, err error) {
 		in:           os.Stdin,
 		out:          os.Stderr,
 		statePath:    host.AgentVersionsFile(),
-		interrupted:  func() bool { return signalled.Load() != 0 },
+		interrupted:  interrupted,
 		image:        agentImage,
 		imageFound:   agentImageFound,
 	}
 	cleanRebuild := updater.prepare(opts.Rebuild, opts.UpdateAgents, agentUpdateCheckEnabled(settings))
 	// An interrupted update build only warns — it must not fail the start — so the signal is the
 	// one thing that says the user wanted out.
-	if signalled.Load() != 0 {
+	if interrupted() {
 		return 1, fmt.Errorf("interrupted during the agent update")
 	}
 	if cleanRebuild {
@@ -289,6 +329,9 @@ func Start(opts Options) (exitCode int, err error) {
 
 	if err := hooks.RunSetupHost(hooks.Resolve(settings.Hooks.SetupHost, host, opts.ProjectDir, "setupHost"), hookEnv, hookLogDir); err != nil {
 		return 1, err
+	}
+	if interrupted() {
+		return 1, errInterrupted
 	}
 
 	// Runs once per version: clears out resources an older Hole (including the bash 1.x line)
@@ -312,6 +355,9 @@ func Start(opts Options) (exitCode int, err error) {
 	instance.Subnets = []string{sandboxNet.subnet.String(), internetNet.subnet.String()}
 	if err := store.Write(instance); err != nil {
 		logging.Warn("could not update the instance registry: %v", err)
+	}
+	if interrupted() {
+		return 1, errInterrupted
 	}
 
 	gatewayIP, err := network.GatewayIP(sandboxNet.subnet)
@@ -425,6 +471,9 @@ func Start(opts Options) (exitCode int, err error) {
 		}
 		return 1, err
 	}
+	if interrupted() {
+		return 1, errInterrupted
+	}
 
 	// After the gateway (its image provably exists now, and the helper ships inside it),
 	// before the agent — so the agent never runs a moment without working egress.
@@ -462,6 +511,9 @@ func Start(opts Options) (exitCode int, err error) {
 			reportServiceStartFailure(containerEngine, instanceName, "docker")
 			return 1, err
 		}
+		if interrupted() {
+			return 1, errInterrupted
+		}
 	}
 
 	logging.Info("Starting %s agent...", opts.Agent)
@@ -474,6 +526,9 @@ func Start(opts Options) (exitCode int, err error) {
 			reportServiceStartFailure(containerEngine, instanceName, "agent")
 		}
 		return 1, err
+	}
+	if interrupted() {
+		return 1, errInterruptedBeforeAttach
 	}
 
 	agentContainer := instanceName + "-agent-1"
@@ -493,6 +548,9 @@ func Start(opts Options) (exitCode int, err error) {
 		}
 	}
 
+	// Before collectImages, which can take seconds and must not delay the status callers poll.
+	recordPhase(store, instance, state.PhaseRunning)
+
 	// Only now that a working image exists: a failed build must not have removed the previous
 	// one first.
 	collectImages(containerEngine, projectName, imageIdentity, gatewayImage)
@@ -503,17 +561,27 @@ func Start(opts Options) (exitCode int, err error) {
 	return attach(containerEngine, agentContainer), nil
 }
 
-// watchSignals installs the run-wide signal handler. It covers the whole start — including
-// the image build, where a Ctrl-C would otherwise kill the process before any resource was
-// removed. Stopping the agent container first ends an active attach, so both phases end up
-// on the same teardown path.
-//
-// Once signal.Notify is registered the runtime no longer applies the default action, so a
-// second Ctrl-C cannot interrupt teardown half-way. Immunity to a *killed* CLI needs the
-// detached watchdog of the next phase.
-func watchSignals(containerEngine *engine.Engine, instance *state.Instance, signalled *atomic.Int32) {
+// notifySignals registers the run-wide signals on a buffered channel. From then on the runtime
+// no longer applies the default action (immediate exit), and a signal that arrives before
+// watchSignals starts consuming waits in the channel.
+func notifySignals() chan os.Signal {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	return signals
+}
+
+// watchSignals consumes the run-wide signals. It covers the whole start — including the image
+// build, where a Ctrl-C would otherwise kill the process before any resource was removed. The
+// signal is recorded for Start's interruption checkpoints, the instance is marked stopping, and
+// stopping the agent container ends an active attach, so every phase ends up on the same
+// teardown path.
+//
+// A second Ctrl-C cannot interrupt teardown half-way, because the default action no longer
+// applies. Immunity to a *killed* CLI is the detached watchdog's job.
+//
+// It takes the instance name, not the instance: the struct belongs to the main goroutine.
+func watchSignals(signals chan os.Signal, containerEngine *engine.Engine, store *state.Store,
+	instanceName string, signalled *atomic.Int32) {
 	go func() {
 		sig, ok := <-signals
 		if !ok {
@@ -522,10 +590,71 @@ func watchSignals(containerEngine *engine.Engine, instance *state.Instance, sign
 		signalled.Store(int32(exitCodeForSignal(sig)))
 		logging.Line()
 		logging.Warn("received %s, destroying sandbox...", sig)
+		markStopping(store, instanceName)
 		// Stopping the agent container ends an active attach; the interrupted step then
 		// returns and the normal deferred teardown runs.
-		_ = containerEngine.ContainerStop(instance.InstanceName + "-agent-1")
+		_ = containerEngine.ContainerStop(instanceName + "-agent-1")
 	}()
+}
+
+// markStopping records the stopping status under the teardown lock, so the marker can never be
+// created after Teardown deregistered the instance. A busy lock means a teardown is running,
+// which marks stopping itself; not waiting for it keeps the agent stop that follows immediate.
+func markStopping(store *state.Store, instanceName string) {
+	unlock, busy := tryLockInstance(store.LockPath(instanceName))
+	if busy {
+		return
+	}
+	defer unlock()
+	if store.Exists(instanceName) {
+		store.MarkStopping(instanceName)
+	}
+}
+
+// recordPhase writes a phase under the instance's teardown lock and only while the instance is
+// still registered: a watchdog that already tore the sandbox down must not have it re-created.
+// It never waits for the lock — an agent that exits at once is torn down by the watchdog while
+// the CLI is here, and waiting would make attach find the container gone and lose its exit code.
+func recordPhase(store *state.Store, instance *state.Instance, phase string) {
+	unlock, busy := tryLockInstance(store.LockPath(instance.InstanceName))
+	if busy {
+		return
+	}
+	defer unlock()
+	if !store.Exists(instance.InstanceName) {
+		return
+	}
+	instance.Phase = phase
+	if err := store.Write(instance); err != nil {
+		logging.Warn("could not update the instance registry: %v", err)
+	}
+}
+
+// claimInstanceID rejects a caller-chosen ID that a live sandbox already uses, in any project,
+// before anything is created.
+//
+// Two concurrent starts with the same ID in different projects can both pass this check; the
+// same project is guarded by the liveness lock in Start. Callers generate random IDs, so the
+// cross-project race needs deliberate misuse.
+func claimInstanceID(store *state.Store, instanceID, instanceName string) error {
+	instances, err := store.List()
+	if err != nil {
+		return fmt.Errorf("check instance ID '%s': %w", instanceID, err)
+	}
+	for _, instance := range instances {
+		if instance.InstanceID != instanceID {
+			continue
+		}
+		if !store.Abandoned(instance) {
+			return fmt.Errorf("instance ID '%s' is already in use by %s", instanceID, instance.ProjectPath)
+		}
+		// Overwriting its state file would lose the record of its resources; an abandoned
+		// instance of another project shares no name with this one and is left to GC.
+		if instance.InstanceName == instanceName {
+			return fmt.Errorf("instance ID '%s' has leftovers of an abandoned sandbox; run 'hole list' to clean them up", instanceID)
+		}
+	}
+	return nil
 }
 
 // exitCodeForSignal returns the conventional 128+signal exit code.

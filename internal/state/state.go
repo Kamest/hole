@@ -24,6 +24,16 @@ const (
 	livenessSuffix = ".alive"
 	// abortSuffix names the marker the CLI drops when startup fails before the agent exists.
 	abortSuffix = ".abort"
+	// stoppingSuffix names the marker that reports a sandbox as stopping.
+	stoppingSuffix = ".stopping"
+)
+
+// Phase values recorded in Instance.Phase. Stopping is not a phase value: it is the
+// <instance>.stopping marker, because the CLI's signal goroutine must be able to record it
+// without rewriting a struct the main goroutine owns.
+const (
+	PhaseStarting = "starting"
+	PhaseRunning  = "running"
 )
 
 // Flags records the CLI flags a sandbox was started with.
@@ -86,6 +96,9 @@ type Instance struct {
 	LogFile   string    `json:"logFile,omitempty"`
 	StartedAt time.Time `json:"startedAt"`
 	Version   string    `json:"version,omitempty"`
+	// Phase is PhaseStarting until the agent container is up, then PhaseRunning. Empty in state
+	// files written by older Hole versions; readers treat that as running.
+	Phase string `json:"phase,omitempty"`
 }
 
 // Uptime is how long the sandbox has been running.
@@ -170,6 +183,15 @@ func (s *Store) Remove(instanceName string) {
 	_ = os.Remove(s.LockPath(instanceName))
 	_ = os.Remove(s.LivenessPath(instanceName))
 	_ = os.Remove(filepath.Join(s.dir, instanceName+abortSuffix))
+	_ = os.Remove(filepath.Join(s.dir, instanceName+stoppingSuffix))
+}
+
+// ClearMarkers removes the abort and stopping markers a previous run with the same instance
+// name may have left behind. It leaves the liveness and teardown lock files alone: a live lock
+// may be held on them.
+func (s *Store) ClearMarkers(instanceName string) {
+	_ = os.Remove(filepath.Join(s.dir, instanceName+abortSuffix))
+	_ = os.Remove(filepath.Join(s.dir, instanceName+stoppingSuffix))
 }
 
 // Exists reports whether an instance is still registered.
@@ -261,6 +283,18 @@ func (s *Store) RequestTeardown(instanceName string) {
 // TeardownRequested reports whether the CLI asked for an early teardown.
 func (s *Store) TeardownRequested(instanceName string) bool {
 	_, err := os.Stat(filepath.Join(s.dir, instanceName+abortSuffix))
+	return err == nil
+}
+
+// MarkStopping drops the stopping marker, which `hole list --json` reports as status
+// "stopping". Best-effort.
+func (s *Store) MarkStopping(instanceName string) {
+	_ = os.WriteFile(filepath.Join(s.dir, instanceName+stoppingSuffix), nil, 0o600)
+}
+
+// Stopping reports whether the instance has been marked stopping.
+func (s *Store) Stopping(instanceName string) bool {
+	_, err := os.Stat(filepath.Join(s.dir, instanceName+stoppingSuffix))
 	return err == nil
 }
 

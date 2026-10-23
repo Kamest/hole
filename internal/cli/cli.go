@@ -51,6 +51,11 @@ Options:
       --with-docker           Enable Docker-in-Docker sidecar for the sandbox
       --trust-project         Accept the host access this project's settings
                                   asks for without being asked, and remember it
+      --instance-id ID        Use this instance ID (6 characters a-z, 0-9) instead
+                                  of a random one; start only
+      --json                  Print running sandboxes as JSON; list only
+      --no-gc                 Do not clean up leftovers of dead sandboxes while
+                                  listing; list only
   --                          Separator for agent-specific arguments;
                                   everything after -- is passed to the agent CLI
 
@@ -70,7 +75,11 @@ Examples:
   hole start claude . -- -p "explain this function"
   hole start claude . --rebuild -- --output-format stream-json
   hole start claude . --update-agents     # newest agent CLIs, setup hooks not re-run
+  hole start claude . --instance-id r8tq2c
   hole list                               # show running sandboxes
+  hole list --json                        # running sandboxes as JSON
+  hole list --json r8tq2c                 # one sandbox as JSON, [] if not running
+  hole list --json --no-gc r8tq2c         # same, without cleaning up (for polling)
   hole destroy                            # destroy ALL Hole Docker resources
   hole destroy .                          # destroy resources for current project
   hole destroy /path/to/project           # destroy resources for specific project
@@ -93,6 +102,12 @@ type Invocation struct {
 	UpdateAgents      bool
 	// Libraries are the raw --library values, in the order they were given.
 	Libraries []string
+	// InstanceID is the --instance-id value, already format-validated; start only.
+	InstanceID string
+	// JSON is --json; list only.
+	JSON bool
+	// NoGC is --no-gc; list only.
+	NoGC bool
 }
 
 // Parse turns raw arguments into an invocation.
@@ -100,6 +115,7 @@ func Parse(args []string) (*Invocation, error) {
 	inv := &Invocation{}
 	parsingHoleArgs := true
 	expectLibrary := false
+	expectInstanceID := false
 	for _, arg := range args {
 		if !parsingHoleArgs {
 			inv.AgentArgs = append(inv.AgentArgs, arg)
@@ -108,6 +124,14 @@ func Parse(args []string) (*Invocation, error) {
 		if expectLibrary {
 			inv.Libraries = append(inv.Libraries, arg)
 			expectLibrary = false
+			continue
+		}
+		if expectInstanceID {
+			if err := hostenv.ValidateInstanceID(arg); err != nil {
+				return nil, err
+			}
+			inv.InstanceID = arg
+			expectInstanceID = false
 			continue
 		}
 		switch arg {
@@ -128,11 +152,24 @@ func Parse(args []string) (*Invocation, error) {
 		case "--library":
 			// The value is the next argument; the `--library=x` form is handled below.
 			expectLibrary = true
+		case "--instance-id":
+			expectInstanceID = true
+		case "--json":
+			inv.JSON = true
+		case "--no-gc":
+			inv.NoGC = true
 		case "--":
 			parsingHoleArgs = false
 		default:
 			if value, ok := strings.CutPrefix(arg, "--library="); ok {
 				inv.Libraries = append(inv.Libraries, value)
+				continue
+			}
+			if value, ok := strings.CutPrefix(arg, "--instance-id="); ok {
+				if err := hostenv.ValidateInstanceID(value); err != nil {
+					return nil, err
+				}
+				inv.InstanceID = value
 				continue
 			}
 			if strings.HasPrefix(arg, "-") && arg != "-" {
@@ -144,6 +181,9 @@ func Parse(args []string) (*Invocation, error) {
 
 	if expectLibrary {
 		return nil, fmt.Errorf("--library needs a value: PATH[:MOUNT][:rw]")
+	}
+	if expectInstanceID {
+		return nil, fmt.Errorf("--instance-id needs a value: 6 characters a-z, 0-9")
 	}
 
 	if len(inv.Positional) > 0 {
@@ -165,6 +205,18 @@ func Run(args []string) int {
 	// except `start` — accepting it silently elsewhere would hide a typo.
 	if inv.Command != "start" && len(inv.Positional) > 0 && strings.Contains(inv.Positional[0], ":") {
 		logging.Error("profiles can only be used with the start command")
+		return 1
+	}
+	if inv.Command != "start" && inv.InstanceID != "" {
+		logging.Error("--instance-id can only be used with the start command")
+		return 1
+	}
+	if inv.Command != "list" && inv.JSON {
+		logging.Error("--json can only be used with the list command")
+		return 1
+	}
+	if inv.Command != "list" && inv.NoGC {
+		logging.Error("--no-gc can only be used with the list command")
 		return 1
 	}
 
@@ -264,6 +316,7 @@ func runStart(inv *Invocation) int {
 		UpdateAgents:      inv.UpdateAgents,
 		Libraries:         inv.Libraries,
 		AgentArgs:         inv.AgentArgs,
+		InstanceID:        inv.InstanceID,
 	})
 	if err != nil {
 		logging.Error("%v", err)
@@ -275,11 +328,19 @@ func runStart(inv *Invocation) int {
 }
 
 func runList(inv *Invocation) int {
-	if len(inv.Positional) > 0 {
-		logging.Error("unexpected argument '%s'; usage: hole list", inv.Positional[0])
+	if len(inv.Positional) > 1 {
+		logging.Error("unexpected argument '%s'; usage: hole list [--json] [instance-id]", inv.Positional[1])
 		return 1
 	}
-	if err := sandbox.List(os.Stdout); err != nil {
+	var instanceID string
+	if len(inv.Positional) == 1 {
+		instanceID = inv.Positional[0]
+		if err := hostenv.ValidateInstanceID(instanceID); err != nil {
+			logging.Error("%v", err)
+			return 1
+		}
+	}
+	if err := sandbox.List(os.Stdout, sandbox.ListOptions{JSON: inv.JSON, NoGC: inv.NoGC, InstanceID: instanceID}); err != nil {
 		logging.Error("%v", err)
 		return 1
 	}
