@@ -17,7 +17,7 @@ missing override is fatal rather than a silent fall-back to defaults. The path t
 is recorded in `Instance.SettingsFiles`, which `hole list` labels from (`global(<path>)`), not from
 the listing process's own environment.
 
-The main project's document comes from `Host.ProjectSettingsPath(projectDir)`:
+The main project's document comes from `Host.ProjectSettingsFile(projectDir)`:
 `HOLE_PROJECT_SETTINGS_FILE` replaces `<project>/.hole/settings.json` when set. It occupies the
 project slot of the same two-document pipeline, so `ResolveChain`, `MergeWithProfile`, the
 `globalOnly` image baseline and the trust gate are unchanged; the in-repo file is not read at all
