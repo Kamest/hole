@@ -1059,3 +1059,73 @@ func TestEarlySIGINTEndsInTeardown(t *testing.T) {
 	waitGone(t, home, instanceName, 2*time.Minute)
 	assertNoLeftovers(t, projectDir)
 }
+
+// A runtime allow entry takes effect in the running sandbox at once and dies with it: the next
+// start of the same project begins with the allow list from settings again.
+func TestModifyAllowsDomainUntilSandboxEnds(t *testing.T) {
+	home, projectDir := environment(t, longRunningAgent, "")
+
+	resolves := func(instanceName string) bool {
+		return exec.Command("docker", "exec", instanceName+"-agent-1", "getent", "hosts", "example.org").Run() == nil
+	}
+	runtimeEntryCount := func(instanceID string) int {
+		stdout, stderr, code := runHoleStdout(t, home, 5*time.Minute, "list", "--json", instanceID)
+		if code != 0 {
+			t.Fatalf("hole list --json exited with %d:\n%s", code, stderr)
+		}
+		var entries []struct {
+			Status            string `json:"status"`
+			RuntimeEntryCount int    `json:"runtimeEntryCount"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &entries); err != nil || len(entries) != 1 {
+			t.Fatalf("hole list --json %s = %q (%v)", instanceID, stdout, err)
+		}
+		return entries[0].RuntimeEntryCount
+	}
+	run := func(instanceID string, check func(instanceName string)) {
+		cmd, instanceName := startInBackground(t, home, projectDir, "--instance-id", instanceID)
+		defer func() {
+			_ = cmd.Process.Signal(syscall.SIGINT)
+			_ = cmd.Wait()
+			waitGone(t, home, instanceName, 2*time.Minute)
+		}()
+		// modify refuses a sandbox that has not recorded the running phase yet.
+		deadline := time.Now().Add(time.Minute)
+		for entries := listJSON(t, home, instanceID); len(entries) != 1 || entries[0].Status != "running"; entries = listJSON(t, home, instanceID) {
+			if time.Now().After(deadline) {
+				t.Fatalf("the sandbox never reported running")
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+		check(instanceName)
+	}
+
+	run("e2emd1", func(instanceName string) {
+		if resolves(instanceName) {
+			t.Fatal("example.org resolves before it is allowed")
+		}
+		stdout, stderr, code := runHoleStdout(t, home, 2*time.Minute, "modify", projectDir, "network.allow", "add", "example.org")
+		if code != 0 || stdout != "" {
+			t.Fatalf("hole modify add: exit %d, stdout %q\n%s", code, stdout, stderr)
+		}
+		if !resolves(instanceName) {
+			t.Error("example.org does not resolve after hole modify add")
+		}
+		if count := runtimeEntryCount("e2emd1"); count != 1 {
+			t.Errorf("runtimeEntryCount = %d, want 1", count)
+		}
+		stdout, _, code = runHoleStdout(t, home, time.Minute, "modify", projectDir, "network.allow", "list", "--json")
+		if code != 0 || !strings.Contains(stdout, `"entry": "example.org:80,443"`) || !strings.Contains(stdout, `"source": "runtime"`) {
+			t.Errorf("hole modify list --json: exit %d\n%s", code, stdout)
+		}
+	})
+
+	run("e2emd2", func(instanceName string) {
+		if resolves(instanceName) {
+			t.Error("a runtime entry of the previous sandbox leaked into a new one")
+		}
+		if count := runtimeEntryCount("e2emd2"); count != 0 {
+			t.Errorf("runtimeEntryCount of a fresh sandbox = %d, want 0", count)
+		}
+	})
+}

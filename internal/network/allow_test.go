@@ -3,6 +3,7 @@ package network
 import (
 	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -162,14 +163,19 @@ func TestBuildPolicyGroupsByPortSet(t *testing.T) {
 		{Kind: KindExact, Host: "db.example.com", Ports: []int{5432}},
 		{Kind: KindCIDR, Host: "10.0.0.0/24", Ports: []int{5432}},
 	}
-	policy := BuildPolicy(entries, nil, false)
+	policy := BuildPolicy(entries, nil, nil, false)
 
 	if len(policy.Groups) != 2 {
 		t.Fatalf("expected 2 port groups, got %d: %+v", len(policy.Groups), policy.Groups)
 	}
-	// Groups are keyed by port set and named deterministically.
-	if policy.Groups[0].Name != "g0" || policy.Groups[1].Name != "g1" {
-		t.Errorf("group names are not stable: %+v", policy.Groups)
+	// Groups are keyed by port set and named by content.
+	for _, group := range policy.Groups {
+		if !strings.HasPrefix(group.Name, "b_") || len(group.Name) != len("b_")+10 {
+			t.Errorf("group name %q is not a base set hash", group.Name)
+		}
+	}
+	if policy.Groups[0].Name == policy.Groups[1].Name {
+		t.Errorf("groups with different port sets share a name: %+v", policy.Groups)
 	}
 	if !reflect.DeepEqual(policy.Exact, []string{"a.example.com", "db.example.com"}) {
 		t.Errorf("exact names = %v", policy.Exact)
@@ -184,7 +190,7 @@ func TestBuildPolicyMergesPortsOfRepeatedHost(t *testing.T) {
 		{Kind: KindExact, Host: "github.com", Ports: []int{443}},
 		{Kind: KindExact, Host: "github.com", Ports: []int{22}},
 	}
-	policy := BuildPolicy(entries, nil, false)
+	policy := BuildPolicy(entries, nil, nil, false)
 	if len(policy.Groups) != 1 {
 		t.Fatalf("expected one group, got %+v", policy.Groups)
 	}
@@ -219,7 +225,7 @@ func TestBuildPolicyMergesHostGatewayDomains(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			policy := BuildPolicy(nil, test.entries, false)
+			policy := BuildPolicy(nil, nil, test.entries, false)
 			if !reflect.DeepEqual(policy.HostGateway, test.want) {
 				t.Fatalf("HostGateway = %+v, want %+v", policy.HostGateway, test.want)
 			}
@@ -242,9 +248,9 @@ func TestBuildPolicyIsDeterministic(t *testing.T) {
 		{Kind: KindExact, Host: "a.example.com", Ports: []int{443}},
 		{Kind: KindIP, Host: "10.0.0.9", Ports: []int{443}},
 	}
-	first := BuildPolicy(entries, nil, false)
+	first := BuildPolicy(entries, nil, nil, false)
 	for i := 0; i < 20; i++ {
-		if !reflect.DeepEqual(BuildPolicy(entries, nil, false), first) {
+		if !reflect.DeepEqual(BuildPolicy(entries, nil, nil, false), first) {
 			t.Fatal("BuildPolicy is not deterministic")
 		}
 	}
@@ -254,7 +260,7 @@ func TestPolicyRegex(t *testing.T) {
 	policy := BuildPolicy([]Entry{
 		{Kind: KindExact, Host: "api.github.com", Ports: []int{443}},
 		{Kind: KindWildcard, Host: "npmjs.org", Ports: []int{443}},
-	}, nil, false)
+	}, nil, nil, false)
 
 	regex := policy.PolicyRegex()
 	matcher := mustCompile(t, regex)
@@ -306,7 +312,7 @@ func TestPolicyAllowsDockerHub(t *testing.T) {
 				}
 				entries = append(entries, entry)
 			}
-			if got := BuildPolicy(entries, nil, false).AllowsDockerHub(); got != test.want {
+			if got := BuildPolicy(entries, nil, nil, false).AllowsDockerHub(); got != test.want {
 				t.Errorf("AllowsDockerHub() for %v = %v, want %v", test.allow, got, test.want)
 			}
 		})
@@ -316,13 +322,13 @@ func TestPolicyAllowsDockerHub(t *testing.T) {
 // Unrestricted mode allows every host, so withholding the cache there would remove a capability
 // without removing any access.
 func TestPolicyAllowsDockerHubWhenUnrestricted(t *testing.T) {
-	if !BuildPolicy(nil, nil, true).AllowsDockerHub() {
+	if !BuildPolicy(nil, nil, nil, true).AllowsDockerHub() {
 		t.Error("an unrestricted policy must allow Docker Hub")
 	}
 }
 
 func TestPolicyRegexEmptyWhenNothingAllowed(t *testing.T) {
-	if got := BuildPolicy(nil, nil, false).PolicyRegex(); got != "" {
+	if got := BuildPolicy(nil, nil, nil, false).PolicyRegex(); got != "" {
 		t.Errorf("expected empty regex for empty policy, got %q", got)
 	}
 }
@@ -357,4 +363,148 @@ func mustCompile(t *testing.T, pattern string) *regexp.Regexp {
 		t.Fatalf("generated policy regex does not compile: %v", err)
 	}
 	return compiled
+}
+
+// Matches decides which refused names `hole modify list-blocked` reports, so it has to agree
+// with the regex CoreDNS actually enforces.
+func TestPolicyMatchesAgreesWithRegex(t *testing.T) {
+	policy := BuildPolicy([]Entry{
+		{Kind: KindExact, Host: "api.github.com", Ports: []int{443}},
+		{Kind: KindExact, Host: "github.com", Ports: []int{443}},
+		{Kind: KindWildcard, Host: "npmjs.org", Ports: []int{443}},
+	}, []Entry{{Kind: KindWildcard, Host: "example.com", Ports: []int{8080}}}, nil, false)
+	matcher := mustCompile(t, policy.PolicyRegex())
+
+	names := []string{
+		"api.github.com", "API.GitHub.com.", "github.com", "evilgithub.com", "x.github.com",
+		"npmjs.org", "registry.npmjs.org", "a.b.npmjs.org.", "npmjs.org.evil.com",
+		"example.com", "api.example.com", "API.EXAMPLE.COM.", "notexample.com", "",
+	}
+	for _, name := range names {
+		if got, want := policy.Matches(name), matcher.MatchString(name); got != want {
+			t.Errorf("Matches(%q) = %v, regex says %v", name, got, want)
+		}
+	}
+	if !BuildPolicy(nil, nil, nil, true).Matches("anything.example") {
+		t.Error("an unrestricted policy must match every name")
+	}
+}
+
+// Adding a runtime entry must not rename an existing set: dnsmasq has recorded addresses in it,
+// and a renamed set starts empty.
+func TestBuildPolicySetNamesStableWhenEntryAdded(t *testing.T) {
+	base := []Entry{
+		{Kind: KindExact, Host: "github.com", Ports: []int{22, 443}},
+		{Kind: KindExact, Host: "api.github.com", Ports: []int{80, 443}},
+	}
+	before := BuildPolicy(base, nil, nil, false)
+	after := BuildPolicy(append(base, Entry{Kind: KindExact, Host: "zzz.example.com", Ports: []int{9000}}),
+		[]Entry{{Kind: KindExact, Host: "aaa.example.com", Ports: []int{1}}}, nil, false)
+	names := map[string]bool{}
+	for _, group := range after.Groups {
+		names[group.Name] = true
+	}
+	for _, group := range before.Groups {
+		if !names[group.Name] {
+			t.Errorf("set %s disappeared after adding unrelated entries: %+v", group.Name, after.Groups)
+		}
+	}
+}
+
+// dnsmasq only ever adds addresses, so a set shared by a base and a runtime entry would keep a
+// removed runtime entry's addresses reachable.
+func TestBuildPolicyKeepsLayersApart(t *testing.T) {
+	policy := BuildPolicy(
+		[]Entry{{Kind: KindExact, Host: "a.example.com", Ports: []int{80, 443}}},
+		[]Entry{{Kind: KindExact, Host: "b.example.com", Ports: []int{80, 443}}}, nil, false)
+	if len(policy.Groups) != 2 {
+		t.Fatalf("expected one base and one runtime group, got %+v", policy.Groups)
+	}
+	if policy.Groups[0].Layer != LayerBase || !strings.HasPrefix(policy.Groups[0].Name, "b_") {
+		t.Errorf("first group = %+v, want the base group", policy.Groups[0])
+	}
+	if policy.Groups[1].Layer != LayerRuntime || !strings.HasPrefix(policy.Groups[1].Name, "r_") {
+		t.Errorf("second group = %+v, want the runtime group", policy.Groups[1])
+	}
+}
+
+// A changed static list must become a new set rather than a flushed one.
+func TestBuildPolicyStaticSetNameFollowsElements(t *testing.T) {
+	one := BuildPolicy(nil, []Entry{{Kind: KindIP, Host: "10.0.0.1", Ports: []int{443}}}, nil, false)
+	two := BuildPolicy(nil, []Entry{
+		{Kind: KindIP, Host: "10.0.0.1", Ports: []int{443}},
+		{Kind: KindIP, Host: "10.0.0.2", Ports: []int{443}},
+	}, nil, false)
+	if one.Groups[0].StaticName == two.Groups[0].StaticName {
+		t.Errorf("static set name %s did not change with its elements", one.Groups[0].StaticName)
+	}
+	if one.Groups[0].Name != two.Groups[0].Name {
+		t.Errorf("dynamic set name changed with the static elements: %s vs %s", one.Groups[0].Name, two.Groups[0].Name)
+	}
+}
+
+func TestRejectRuntimeDockerHub(t *testing.T) {
+	tests := []struct {
+		raw    string
+		reject bool
+	}{
+		{"docker.io", true},
+		{"*.docker.io", true},
+		{"DOCKER.io:443", true},
+		{"registry-1.docker.io", false},
+		{"mydocker.io", false},
+		{"github.com", false},
+	}
+	for _, test := range tests {
+		entry, err := ParseEntry(test.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := RejectRuntimeDockerHub(entry) != nil; got != test.reject {
+			t.Errorf("RejectRuntimeDockerHub(%q) rejected = %v, want %v", test.raw, got, test.reject)
+		}
+	}
+}
+
+func TestHostGatewayConflicts(t *testing.T) {
+	zones := []HostGatewayDomain{{Domain: "db.example.com", Ports: []int{5432}}}
+	tests := []struct {
+		raw      string
+		conflict bool
+	}{
+		{"db.example.com", true},
+		{"api.db.example.com", true},
+		{"*.db.example.com", true},
+		{"*.example.com", true},
+		{"*.api.db.example.com", true},
+		{"example.com", false},
+		{"otherdb.example.com", false},
+		{"*.otherdb.example.com", false},
+		{"10.0.0.1", false},
+	}
+	for _, test := range tests {
+		entry, err := ParseEntry(test.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := len(HostGatewayConflicts(zones, []Entry{entry})) > 0; got != test.conflict {
+			t.Errorf("HostGatewayConflicts(db.example.com, %q) = %v, want %v", test.raw, got, test.conflict)
+		}
+	}
+}
+
+// Two runtime entries with the same ports must not share a set: removing one would leave its
+// recorded addresses reachable through the set the other keeps alive.
+func TestBuildPolicyGivesRuntimeDomainsOwnSets(t *testing.T) {
+	both := BuildPolicy(nil, []Entry{
+		{Kind: KindExact, Host: "a.example.com", Ports: []int{443}},
+		{Kind: KindExact, Host: "b.example.com", Ports: []int{443}},
+	}, nil, false)
+	if len(both.Groups) != 2 || both.Groups[0].Name == both.Groups[1].Name {
+		t.Fatalf("runtime entries share a set: %+v", both.Groups)
+	}
+	one := BuildPolicy(nil, []Entry{{Kind: KindExact, Host: "a.example.com", Ports: []int{443}}}, nil, false)
+	if one.Groups[0].Name != both.Groups[0].Name && one.Groups[0].Name != both.Groups[1].Name {
+		t.Errorf("set of a.example.com was renamed when b.example.com was added")
+	}
 }

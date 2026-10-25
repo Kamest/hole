@@ -1,0 +1,13 @@
+#!/usr/sbin/nft -f
+# In-place update of a running gateway; the input and postrouting chains never change at runtime.
+flush chain inet hole forward
+
+table inet hole {
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        meta nfproto ipv6 drop
+        ct state established,related accept
+        counter limit rate 10/minute log prefix "hole-denied " level info
+    }
+}

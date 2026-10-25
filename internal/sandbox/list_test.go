@@ -36,6 +36,8 @@ func TestWriteListJSONSchema(t *testing.T) {
 	instance.StartedAt = time.Now().Add(-90 * time.Second)
 	instance.Phase = state.PhaseRunning
 	instance.Flags.WithDocker = true
+	instance.RuntimeAllow = []string{"example.com:80,443"}
+	instance.RuntimeHostGatewayDomains = []string{"mydb.local:5432"}
 
 	var out bytes.Buffer
 	if err := writeListJSON(&out, host, store, runningInstances(store, []*state.Instance{instance})); err != nil {
@@ -56,8 +58,8 @@ func TestWriteListJSONSchema(t *testing.T) {
 	}
 	sort.Strings(keys)
 	wantKeys := []string{"agent", "docker", "flags", "instanceId", "instanceName", "networks", "pid",
-		"profile", "projectName", "projectPath", "settings", "settingsFiles", "startedAt", "status",
-		"uptimeSeconds", "version"}
+		"profile", "projectName", "projectPath", "runtimeEntryCount", "settings", "settingsFiles", "startedAt",
+		"status", "uptimeSeconds", "version"}
 	if !reflect.DeepEqual(keys, wantKeys) {
 		t.Errorf("keys = %v, want %v", keys, wantKeys)
 	}
@@ -89,6 +91,9 @@ func TestWriteListJSONSchema(t *testing.T) {
 	sort.Strings(flagKeys)
 	if !reflect.DeepEqual(flagKeys, []string{"debug", "dumpNetworkAccess", "rebuild", "unrestricted", "withDocker"}) {
 		t.Errorf("flag keys = %v", flagKeys)
+	}
+	if entry["runtimeEntryCount"] != float64(2) {
+		t.Errorf("runtimeEntryCount = %v, want 2", entry["runtimeEntryCount"])
 	}
 	if flags["withDocker"] != true {
 		t.Errorf("flags.withDocker = %v, want true", flags["withDocker"])
@@ -161,8 +166,8 @@ func TestWriteListTableFormat(t *testing.T) {
 	if err := writeListTable(&out, host, []*state.Instance{instance}); err != nil {
 		t.Fatal(err)
 	}
-	want := "INSTANCE  AGENT            PROJECT         UPTIME  DOCKER  NETWORK         SETTINGS\n" +
-		"abc123    claude:research  /projects/demo  -       yes     hole-x_sandbox  global(~/.hole/settings.json)+project\n"
+	want := "INSTANCE  AGENT            PROJECT         UPTIME  DOCKER  NETWORK         RUNTIME  SETTINGS\n" +
+		"abc123    claude:research  /projects/demo  -       yes     hole-x_sandbox  0        global(~/.hole/settings.json)+project\n"
 	if out.String() != want {
 		t.Errorf("table =\n%s\nwant\n%s", out.String(), want)
 	}

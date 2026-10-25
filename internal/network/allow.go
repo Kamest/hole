@@ -4,6 +4,8 @@
 package network
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -37,6 +39,12 @@ const (
 )
 
 var domainPattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$`)
+
+// IsDomainName reports whether a name is a syntactically valid domain name (no wildcard, no
+// trailing dot).
+func IsDomainName(name string) bool {
+	return domainPattern.MatchString(name)
+}
 
 // Entry is one parsed allow-list rule: a host matcher plus the ports it opens. Ports apply
 // to TCP and UDP alike.
@@ -194,6 +202,11 @@ type HostGatewayDomain struct {
 	Ports []int
 }
 
+// String renders the entry back into its `<domain>:<port>[,<port>...]` form.
+func (h HostGatewayDomain) String() string {
+	return Entry{Kind: KindExact, Host: h.Domain, Ports: h.Ports}.String()
+}
+
 // ParseHostGatewayDomain validates one `network.hostGatewayDomains` entry:
 // `<domain>:<port>[,<port>...]`. The port list is mandatory — the firewall matches the host
 // gateway address, so a port-less entry would expose every service on the host.
@@ -223,22 +236,50 @@ func ParseHostGatewayDomain(raw string) (HostGatewayDomain, error) {
 	return HostGatewayDomain{Domain: strings.ToLower(domainPart), Ports: ports}, nil
 }
 
-// Group is a set of hosts sharing one port set. Each group becomes one nftables set pair
-// plus the dnsmasq lines that populate it.
+// Layer separates the allow entries a sandbox started with from those `hole modify` added to the
+// running gateway. Entries of different layers never share an nftables set: dnsmasq only ever adds
+// addresses, so a set shared with a removed runtime entry would keep its addresses reachable.
+type Layer string
+
+const (
+	// LayerBase holds the entries from settings and agents' allow.txt.
+	LayerBase Layer = "base"
+	// LayerRuntime holds the entries `hole modify` added to a running sandbox.
+	LayerRuntime Layer = "runtime"
+)
+
+// Group is a set of hosts of one layer sharing one port set. Each group becomes one dynamic
+// nftables set (fed by dnsmasq) and, when it holds literal addresses, one static interval set.
+//
+// A runtime domain entry always gets a group of its own: dnsmasq only ever adds addresses, so
+// removing one entry of a shared set would leave its addresses reachable through the set that
+// stays. Its own set is deleted with it. (A dnsmasq line shared with a base entry of the same key
+// can still record its addresses into the base set too; see nftsetRules.)
 type Group struct {
-	// Name is the nftables set name (`g0`, `g1`, ...).
-	Name  string
-	Ports []int
-	// Domains are exact and wildcard base names; dnsmasq matching is suffix-wide, which is
-	// harmless because CoreDNS only forwards names the policy already approved.
-	Domains []string
-	// Statics are literal IPs and CIDRs, loaded into a static interval set.
+	Layer Layer
+	// Name is the dynamic set name, `b_<hash>` or `r_<hash>` of the layer and port list (and the
+	// host, for a runtime domain entry), so adding an unrelated entry never renames a set and its
+	// recorded addresses survive.
+	Name string
+	// StaticName is the static set name, hashed over the elements too: a changed address list
+	// becomes a new set rather than a flushed one.
+	StaticName string
+	Ports      []int
+	// Exact and Wildcards are the group's domain entries (wildcards without the `*.` prefix).
+	Exact     []string
+	Wildcards []string
+	// Statics are literal IPs and CIDRs, loaded into the static interval set.
 	Statics []string
+}
+
+// HasDomains reports whether dnsmasq feeds this group's dynamic set.
+func (g Group) HasDomains() bool {
+	return len(g.Exact) > 0 || len(g.Wildcards) > 0
 }
 
 // Policy is the fully resolved egress policy for one sandbox run.
 type Policy struct {
-	// Exact and Wildcards drive the CoreDNS policy regex.
+	// Exact and Wildcards drive the CoreDNS policy regex, across both layers.
 	Exact     []string
 	Wildcards []string
 	Groups    []Group
@@ -261,68 +302,169 @@ func (p Policy) AllowsDockerHub() bool {
 		slices.Contains(p.Wildcards, DockerHubToken)
 }
 
-// BuildPolicy folds allow entries into a deterministic policy: entries for the same host
-// merge their ports, hosts are grouped by identical port sets, and groups are named in a
-// stable order so generated artifacts are reproducible.
-func BuildPolicy(entries []Entry, hostGateway []HostGatewayDomain, unrestricted bool) Policy {
+// Matches reports whether the policy lets a DNS name resolve. It mirrors PolicyRegex: exact names
+// match themselves, wildcards match strictly below their host, case and one trailing dot are
+// ignored. Host gateway zones are not consulted.
+func (p Policy) Matches(name string) bool {
+	if p.Unrestricted {
+		return true
+	}
+	name = strings.TrimSuffix(strings.ToLower(name), ".")
+	if slices.Contains(p.Exact, name) {
+		return true
+	}
+	for _, wildcard := range p.Wildcards {
+		if strings.HasSuffix(name, "."+wildcard) {
+			return true
+		}
+	}
+	return false
+}
+
+// BuildPolicy folds allow entries into a deterministic policy: entries for the same host merge
+// their ports within a layer, hosts of one layer are grouped by identical port sets, and sets are
+// named by content so generated artifacts are reproducible and stable across runtime changes.
+func BuildPolicy(base, runtime []Entry, hostGateway []HostGatewayDomain, unrestricted bool) Policy {
 	type hostKey struct {
-		kind Kind
-		host string
+		layer Layer
+		kind  Kind
+		host  string
 	}
 	portsByHost := map[hostKey][]int{}
 	var order []hostKey
-	for _, entry := range entries {
-		key := hostKey{kind: entry.Kind, host: entry.Host}
-		if _, seen := portsByHost[key]; !seen {
-			order = append(order, key)
+	collect := func(layer Layer, entries []Entry) {
+		for _, entry := range entries {
+			key := hostKey{layer: layer, kind: entry.Kind, host: entry.Host}
+			if _, seen := portsByHost[key]; !seen {
+				order = append(order, key)
+			}
+			portsByHost[key] = normalizePorts(append(portsByHost[key], entry.Ports...))
 		}
-		portsByHost[key] = normalizePorts(append(portsByHost[key], entry.Ports...))
 	}
+	collect(LayerBase, base)
+	collect(LayerRuntime, runtime)
 
 	policy := Policy{HostGateway: mergeHostGateway(hostGateway), Unrestricted: unrestricted}
 
-	groupsByPorts := map[string]*Group{}
-	var groupKeys []string
+	type groupKey struct {
+		layer Layer
+		ports string
+		// host is set only for a runtime domain entry, which gets a set of its own.
+		host string
+	}
+	groups := map[groupKey]*Group{}
+	var groupKeys []groupKey
 	for _, key := range order {
 		ports := portsByHost[key]
 		if len(ports) == 0 {
 			continue
 		}
-		portKey := portsKey(ports)
-		group, ok := groupsByPorts[portKey]
+		gk := groupKey{layer: key.layer, ports: portsKey(ports)}
+		if key.layer == LayerRuntime && (key.kind == KindExact || key.kind == KindWildcard) {
+			gk.host = string(key.kind) + ":" + key.host
+		}
+		group, ok := groups[gk]
 		if !ok {
-			group = &Group{Ports: ports}
-			groupsByPorts[portKey] = group
-			groupKeys = append(groupKeys, portKey)
+			group = &Group{Layer: key.layer, Ports: ports}
+			groups[gk] = group
+			groupKeys = append(groupKeys, gk)
 		}
 		switch key.kind {
 		case KindExact:
 			policy.Exact = append(policy.Exact, key.host)
-			group.Domains = append(group.Domains, key.host)
+			group.Exact = append(group.Exact, key.host)
 		case KindWildcard:
 			policy.Wildcards = append(policy.Wildcards, key.host)
-			group.Domains = append(group.Domains, key.host)
+			group.Wildcards = append(group.Wildcards, key.host)
 		case KindIP, KindCIDR:
 			group.Statics = append(group.Statics, key.host)
 		}
 	}
 
-	sort.Strings(groupKeys)
+	// Base groups first, then by port list.
+	sort.Slice(groupKeys, func(i, j int) bool {
+		if groupKeys[i].layer != groupKeys[j].layer {
+			return groupKeys[i].layer == LayerBase
+		}
+		if groupKeys[i].ports != groupKeys[j].ports {
+			return groupKeys[i].ports < groupKeys[j].ports
+		}
+		return groupKeys[i].host < groupKeys[j].host
+	})
 	sort.Strings(policy.Exact)
 	sort.Strings(policy.Wildcards)
 	policy.Exact = dedup(policy.Exact)
 	policy.Wildcards = dedup(policy.Wildcards)
 
-	for i, portKey := range groupKeys {
-		group := groupsByPorts[portKey]
-		group.Name = fmt.Sprintf("g%d", i)
-		sort.Strings(group.Domains)
+	for _, gk := range groupKeys {
+		group := groups[gk]
+		sort.Strings(group.Exact)
+		sort.Strings(group.Wildcards)
 		sort.Strings(group.Statics)
-		group.Domains = dedup(group.Domains)
+		group.Exact = dedup(group.Exact)
+		group.Wildcards = dedup(group.Wildcards)
 		group.Statics = dedup(group.Statics)
+		prefix := setPrefix(gk.layer)
+		group.Name = prefix + setHash(string(gk.layer), gk.ports, gk.host)
+		if len(group.Statics) > 0 {
+			group.StaticName = prefix + setHash(string(gk.layer), gk.ports, strings.Join(group.Statics, ",")) + "_static"
+		}
 		policy.Groups = append(policy.Groups, *group)
 	}
 	return policy
+}
+
+func setPrefix(layer Layer) string {
+	if layer == LayerRuntime {
+		return "r_"
+	}
+	return "b_"
+}
+
+// setHash is the first 10 hex characters of SHA-256 over the parts, short enough for nft's set
+// name limit and wide enough that a collision within one sandbox is not a practical concern.
+func setHash(parts ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))
+	return hex.EncodeToString(sum[:])[:10]
+}
+
+// RejectRuntimeDockerHub refuses DockerHubToken as a runtime allow entry: the token is a
+// start-time capability that decides whether the Docker Hub image cache is attached, and adding it
+// to a running sandbox could not attach the cache anyway.
+func RejectRuntimeDockerHub(entry Entry) error {
+	if entry.Host == DockerHubToken && (entry.Kind == KindExact || entry.Kind == KindWildcard) {
+		return fmt.Errorf("'%s' cannot be allowed at runtime: it opts the sandbox into the Docker Hub image cache, "+
+			"which is decided at start — add it to network.allow and restart the sandbox", entry)
+	}
+	return nil
+}
+
+// HostGatewayConflicts lists the allow entries a host gateway zone would shadow. A zone answers
+// every name equal to or under its domain with the host gateway address, so an exact entry at or
+// under a zone, and a wildcard whose names overlap the zone in either direction, would resolve to
+// the host instead of the internet. IP and CIDR entries never conflict.
+func HostGatewayConflicts(zones []HostGatewayDomain, entries []Entry) []string {
+	var conflicts []string
+	for _, zone := range zones {
+		for _, entry := range entries {
+			var overlap bool
+			switch entry.Kind {
+			case KindExact:
+				overlap = domainAtOrUnder(entry.Host, zone.Domain)
+			case KindWildcard:
+				overlap = domainAtOrUnder(entry.Host, zone.Domain) || strings.HasSuffix(zone.Domain, "."+entry.Host)
+			}
+			if overlap {
+				conflicts = append(conflicts, fmt.Sprintf("host gateway domain '%s' shadows allow entry '%s'",
+					zone.Domain, entry))
+			}
+		}
+	}
+	return conflicts
+}
+
+func domainAtOrUnder(name, domain string) bool {
+	return name == domain || strings.HasSuffix(name, "."+domain)
 }
 
 // mergeHostGateway folds entries for the same domain into one, unioning their ports. CoreDNS

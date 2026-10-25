@@ -27,6 +27,7 @@ const runLogRetention = 7 * 24 * time.Hour
 
 const helpText = `Usage: hole {command} {agent}[:{profile}] {path} [options]
        hole settings {create|open|get} {project {path}|global} [options]
+       hole modify {path} {setting} [{operation} [{value}...]] [options]
 
 Commands:
   start     Create a sandbox, attach to the agent CLI, and destroy on exit
@@ -35,6 +36,10 @@ Commands:
   update    Update hole to the latest release
   uninstall Uninstall hole and optionally remove Docker resources
   settings  Create, open or locate the project or global settings file
+  modify    Change a setting of a running sandbox (network.allow,
+                network.hostGatewayDomains) with add, remove, list,
+                list-blocked or edit; changes the running sandbox only
+                and is never saved to a settings file
   help      Show this help message
   version   Print the installed hole version
 
@@ -55,8 +60,10 @@ Options:
       --trust-project         Accept the host access this project's settings
                                   asks for without being asked, and remember it
       --instance-id ID        Use this instance ID (6 characters a-z, 0-9) instead
-                                  of a random one; start only
-      --json                  Print running sandboxes as JSON; list only
+                                  of a random one; with modify, the running
+                                  sandbox to change; start and modify only
+      --json                  Print as JSON; list, and modify list and
+                                  list-blocked only
       --no-gc                 Do not clean up leftovers of dead sandboxes while
                                   listing; list only
       --overwrite             Replace an existing settings file with the
@@ -94,6 +101,10 @@ Examples:
   hole settings create global --append    # add $schema to ~/.hole/settings.json
   hole settings open project .            # edit and validate .hole/settings.json
   hole settings get global                # print the global settings file path
+  hole modify . network.allow add example.com:443   # allow a domain until the sandbox ends
+  hole modify . network.allow list --json # effective allow list with sources
+  hole modify . network.allow list-blocked          # names the sandbox was refused
+  hole modify . network.allow             # interactive editor
 
 The sandbox is destroyed when you exit the agent CLI.
 `
@@ -222,16 +233,17 @@ func Run(args []string) int {
 
 	// A profile selects a settings overlay for one sandbox, so it is meaningless anywhere
 	// except `start` — accepting it silently elsewhere would hide a typo.
-	if inv.Command != "start" && len(inv.Positional) > 0 && strings.Contains(inv.Positional[0], ":") {
+	if inv.Command != "start" && inv.Command != "modify" && len(inv.Positional) > 0 &&
+		strings.Contains(inv.Positional[0], ":") {
 		logging.Error("profiles can only be used with the start command")
 		return 1
 	}
-	if inv.Command != "start" && inv.InstanceID != "" {
-		logging.Error("--instance-id can only be used with the start command")
+	if inv.Command != "start" && inv.Command != "modify" && inv.InstanceID != "" {
+		logging.Error("--instance-id can only be used with the start and modify commands")
 		return 1
 	}
-	if inv.Command != "list" && inv.JSON {
-		logging.Error("--json can only be used with the list command")
+	if inv.Command != "list" && inv.Command != "modify" && inv.JSON {
+		logging.Error("--json can only be used with the list and modify commands")
 		return 1
 	}
 	if inv.Command != "list" && inv.NoGC {
@@ -266,6 +278,13 @@ func Run(args []string) int {
 			stderr:   os.Stderr,
 			terminal: isTerminal(os.Stdin) && isTerminal(os.Stdout),
 		})
+	case "modify":
+		return runModify(inv, modifyIO{
+			stdin:    bufio.NewReader(os.Stdin),
+			stdout:   os.Stdout,
+			stderr:   os.Stderr,
+			terminal: isTerminal(os.Stdin) && isTerminal(os.Stdout),
+		})
 	case sandbox.WatchdogCommand:
 		// Hidden: the detached teardown supervisor the CLI spawns for every sandbox.
 		if len(inv.Positional) != 1 {
@@ -276,7 +295,7 @@ func Run(args []string) int {
 		return runDestroy(inv)
 	default:
 		logging.Error("invalid command '%s'", inv.Command)
-		logging.Info("Valid commands: start list destroy settings version update uninstall help")
+		logging.Info("Valid commands: start list destroy settings modify version update uninstall help")
 		return 1
 	}
 }

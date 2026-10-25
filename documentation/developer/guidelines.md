@@ -4,16 +4,22 @@
 
 Go 1.27+, module `github.com/lukashornych/hole/v2` (the suffix is required for a 2.x module and is
 what makes `go install` work — see
-[build & release](build-and-release.md#why-the-module-path-carries-v2)), `CGO_ENABLED=0`. Two
-libraries, each replacing an
-external tool the bash implementation needed:
+[build & release](build-and-release.md#why-the-module-path-carries-v2)), `CGO_ENABLED=0`.
+
+Keep the number of libraries small. This is a principle, not a fixed list: before adding a
+dependency, decide whether the feature really needs a whole library or whether a small utility of
+our own does the job. A library is worth it when the problem is large or full of edge cases
+(a YAML emitter, a JSON Schema engine, a terminal UI); it is not when we would use a sliver of it
+that a few dozen to a hundred lines of standard library cover. Hole ships as one small static
+binary, and its runtime requirements for users are deliberately just docker or podman. Prefer
+pure-Go libraries with a small dependency tree and pin a release at least two weeks old.
+
+Current libraries:
 
 - `gopkg.in/yaml.v3` — compose file generation
 - `github.com/santhosh-tekuri/jsonschema/v6` — settings validation (the engine behind `jv`)
-
-Everything else is standard library. Adding a dependency needs a reason that outweighs the cost of
-carrying it: Hole ships as one small static binary, and its runtime requirements for users are
-deliberately just docker or podman.
+- `github.com/rivo/tview` on `github.com/gdamore/tcell/v2` — the `hole modify … edit` terminal UI;
+  imported only by `internal/modifyui`, so the rest of the code never depends on it
 
 ## Deviations from the rewrite plan
 
@@ -28,7 +34,7 @@ Two, both documented where they are implemented:
 > The rewrite plan named `github.com/creativeprojects/go-selfupdate` for self-update. Its current
 > release pulls in ~50 modules — CEL, antlr, protovalidate, the Gitea SDK, dbus, wincred — for
 > three things that are a hundred lines of standard library in `internal/update`. That is the kind
-> of trade this rule exists to prevent.
+> of trade this principle exists to prevent.
 
 ## Go conventions
 

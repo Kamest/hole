@@ -61,6 +61,25 @@ against the registry at runtime.
    is interesting.
 7. Document it in the README.
 
+## Add a setting to the runtime registry
+
+`hole modify` can change only the settings in `modifiableSettings` (`internal/sandbox/modify.go`).
+To add one:
+
+1. Record its start-time value in `state.Instance` (canonical strings, written by `Start` before
+   the service that uses it exists) and give it a runtime list field next to `RuntimeAllow`.
+2. Add a `ModifiableSetting` entry: `Canonical` parses and validates a single value (it is what
+   equality, state and listings use), `base`/`runtime` point at the two state fields, and
+   `Operations` lists what it supports (`list-blocked` only with `HasBlocked`).
+3. Make the apply re-render it: `parseGatewayConfig` and `renderApplyPayload` build the whole
+   gateway configuration from state. A setting that does not live in the gateway needs its own
+   in-place apply path, with the same rules — validate before changing anything, write state before
+   applying, write the previous lists back on failure.
+4. Extend `validateRuntime` with rules that need the whole configuration, and `runtimeEntryCount`
+   (`hole list`) if its entries should be counted.
+5. Add cases to `modify_test.go` and the CLI parsing table, and document it in the README section
+   *Changing the network of a running sandbox*.
+
 ## Add a runtime asset
 
 Put it under `assets/` beneath an existing embed directive, and materialize it where it is needed
@@ -91,7 +110,7 @@ From the host, against the gateway container:
 ```sh
 docker logs <instance>-gateway-1                       # CoreDNS query log, interface detection
 docker exec <instance>-gateway-1 nft list ruleset      # the live firewall, incl. denial counters
-docker exec <instance>-gateway-1 nft list set inet hole g0   # addresses dnsmasq recorded
+docker exec <instance>-gateway-1 nft list table inet hole   # sets (b_*/r_*) with the addresses dnsmasq recorded
 cat ~/.hole/tmp/run.*/gateway-conf/Corefile            # the generated policy (while running)
 ```
 

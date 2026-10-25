@@ -23,6 +23,16 @@ import (
 // to resolve the name, anything else means the sandbox was allowed to reach it.
 var coreDNSQuery = regexp.MustCompile(`"[A-Z]+ [A-Z]+ ([^ "]+)[^"]*" ([A-Z]+)`)
 
+// parseCoreDNSQuery extracts the queried name (as logged, with its trailing dot) and the response
+// code from one CoreDNS log line. Shared by the -n dump and `hole modify … list-blocked`.
+func parseCoreDNSQuery(line string) (name, rcode string, ok bool) {
+	match := coreDNSQuery.FindStringSubmatch(line)
+	if match == nil {
+		return "", "", false
+	}
+	return match[1], match[2], true
+}
+
 // writeNetworkAccessDump extracts the domains the sandbox resolved (and those it was
 // refused) from the gateway's DNS log.
 //
@@ -44,16 +54,16 @@ func writeNetworkAccessDump(containerEngine *engine.Engine, host hostenv.Host, i
 
 	entries := map[string]bool{}
 	for _, line := range strings.Split(logs, "\n") {
-		match := coreDNSQuery.FindStringSubmatch(line)
-		if match == nil {
+		queried, rcode, ok := parseCoreDNSQuery(line)
+		if !ok {
 			continue
 		}
-		name := strings.TrimSuffix(match[1], ".")
+		name := strings.TrimSuffix(queried, ".")
 		if name == "" || name == network.HealthZone {
 			continue
 		}
 		verdict := "ALLOWED"
-		if match[2] == "NXDOMAIN" {
+		if rcode == "NXDOMAIN" {
 			verdict = "DENIED"
 		}
 		entries[verdict+" "+name] = true

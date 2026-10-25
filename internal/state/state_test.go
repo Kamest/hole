@@ -400,3 +400,48 @@ func TestClearMarkersKeepsLivenessAndState(t *testing.T) {
 		t.Error("the liveness lock is no longer held after ClearMarkers")
 	}
 }
+
+// `hole modify` tells an instance started by an older Hole from one with an empty base list by
+// nil versus empty, so an empty list has to survive the round trip as empty.
+func TestBaseAllowRoundTrip(t *testing.T) {
+	s := store(t)
+	empty := instance("hole-sandbox-demo-1a2b3c4d-empty1")
+	empty.BaseAllow = []SourcedEntry{}
+	if err := s.Write(empty); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := s.Read(empty.InstanceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.BaseAllow == nil {
+		t.Error("an empty base allow list read back as nil")
+	}
+
+	filled := instance("hole-sandbox-demo-1a2b3c4d-full12")
+	filled.BaseAllow = []SourcedEntry{{Entry: "github.com:443,80", Source: "settings"}}
+	filled.RuntimeAllow = []string{"example.com:443,80"}
+	if err := s.Write(filled); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.Read(filled.InstanceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.BaseAllow) != 1 || loaded.BaseAllow[0].Source != "settings" ||
+		len(loaded.RuntimeAllow) != 1 || loaded.RuntimeAllow[0] != "example.com:443,80" {
+		t.Errorf("round trip lost the allow lists: %+v", loaded)
+	}
+
+	legacy := filepath.Join(s.Dir(), "hole-sandbox-demo-1a2b3c4d-old123.json")
+	if err := os.WriteFile(legacy, []byte(`{"instanceName":"hole-sandbox-demo-1a2b3c4d-old123"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.Read("hole-sandbox-demo-1a2b3c4d-old123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.BaseAllow != nil {
+		t.Errorf("a state file without baseAllow read as %v, want nil", loaded.BaseAllow)
+	}
+}

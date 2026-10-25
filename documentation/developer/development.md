@@ -15,9 +15,8 @@ conventions the code must follow, see [guidelines](guidelines.md); for task-shap
 | **golangci-lint** | optional, part of `make lint` | The repo ships **no** `.golangci.yml`, so the linter runs on its defaults. CI pins a version; `.hole/setup.sh` installs the same one, so a different local install can disagree with CI. |
 | **goreleaser** | optional | Only to reproduce the `release-config` CI job locally — see [build & release](build-and-release.md). |
 
-Dependencies of the Go module itself are deliberately two — `gopkg.in/yaml.v3` and
-`github.com/santhosh-tekuri/jsonschema/v6`. Adding a third needs a justification; see
-[guidelines § Toolchain](guidelines.md#toolchain).
+Dependencies of the Go module itself are kept deliberately few — every new one has to be worth more
+than a small utility of our own; see [guidelines § Toolchain](guidelines.md#toolchain).
 
 ## First-time setup
 

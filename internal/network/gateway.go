@@ -1,8 +1,11 @@
 package network
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"text/template"
 )
@@ -13,11 +16,19 @@ import (
 // that ask for both, which is what a bare `nslookup <name>` does.
 const HealthZone = "health.hole.internal"
 
-// Artifacts are the three generated files the gateway container mounts read-only.
+// Artifacts are the generated gateway files. The first three are what the gateway container
+// mounts read-only at start; NftablesApply is the same ruleset in in-place form, which `hole
+// modify` applies to a running gateway.
 type Artifacts struct {
 	Corefile     string
 	DnsmasqConf  string
 	NftablesRule string
+	// NftablesApply replaces the forward chain and adds missing sets without touching existing
+	// sets, their recorded addresses, or the input and postrouting chains.
+	NftablesApply string
+	// Generation identifies the Corefile; the health zone answers it as TXT, which is how an
+	// apply confirms that CoreDNS reloaded.
+	Generation string
 }
 
 const corefileTemplate = `{{ .HealthZone }}:53 {
@@ -26,6 +37,9 @@ const corefileTemplate = `{{ .HealthZone }}:53 {
     }
     template IN AAAA {{ .HealthZone }} {
         rcode NOERROR
+    }
+    template IN TXT {{ .HealthZone }} {
+        answer "{{ "{{ .Name }}" }} 0 IN TXT \"{{ .Generation }}\""
     }
     errors
 }
@@ -69,7 +83,7 @@ const corefileTemplate = `{{ .HealthZone }}:53 {
 `
 
 const dnsmasqTemplate = `# Enforcement back-end: resolves names CoreDNS already approved and records every answered
-# address in the matching nftables set.
+# address in the matching nftables sets.
 port=5353
 listen-address=127.0.0.1
 bind-interfaces
@@ -77,27 +91,36 @@ no-resolv
 no-hosts
 no-poll
 server=127.0.0.11
-{{- range $group := .Groups }}
-{{- range $domain := $group.Domains }}
-nftset=/{{ $domain }}/4#inet#hole#{{ $group.Name }}
-{{- end }}
+{{- range .Rules }}
+nftset=/{{ .Key }}/{{ range $i, $set := .Sets }}{{ if $i }},{{ end }}4#inet#hole#{{ $set }}{{ end }}
 {{- end }}
 `
 
+// nftablesTemplate renders in two modes. Start mode re-creates the whole table, which makes it
+// idempotent on container restart. In-place mode is one atomic transaction against a running
+// gateway: the forward chain is flushed and re-declared with its rules, and the sets are declared
+// so missing ones are created while existing ones keep their elements. No set is flushed or
+// destroyed here — flushing a set that does not exist yet fails the whole file, and `destroy`
+// needs kernel 6.3 — so the apply script deletes unused sets afterwards.
 const nftablesTemplate = `#!/usr/sbin/nft -f
+{{- if .InPlace }}
+# In-place update of a running gateway; the input and postrouting chains never change at runtime.
+flush chain inet hole forward
+{{- else }}
 # Re-creating the table makes this ruleset idempotent on container restart.
 table inet hole
 delete table inet hole
+{{- end }}
 
 table inet hole {
 {{- range .Groups }}
-{{- if .Domains }}
+{{- if .HasDomains }}
     set {{ .Name }} {
         type ipv4_addr
     }
 {{- end }}
 {{- if .Statics }}
-    set {{ .Name }}_static {
+    set {{ .StaticName }} {
         type ipv4_addr
         flags interval
         # auto-merge collapses an address already covered by a CIDR in the same set; without it
@@ -118,18 +141,19 @@ table inet hole {
         ip daddr {HOST_GATEWAY_IP} udp dport { {{ ports .HostGatewayPorts }} } accept
 {{- end }}
 {{- range .Groups }}
-{{- if .Domains }}
+{{- if .HasDomains }}
         ip daddr @{{ .Name }} tcp dport { {{ ports .Ports }} } accept
         ip daddr @{{ .Name }} udp dport { {{ ports .Ports }} } accept
 {{- end }}
 {{- if .Statics }}
-        ip daddr @{{ .Name }}_static tcp dport { {{ ports .Ports }} } accept
-        ip daddr @{{ .Name }}_static udp dport { {{ ports .Ports }} } accept
+        ip daddr @{{ .StaticName }} tcp dport { {{ ports .Ports }} } accept
+        ip daddr @{{ .StaticName }} udp dport { {{ ports .Ports }} } accept
 {{- end }}
 {{- end }}
         counter limit rate 10/minute log prefix "hole-denied " level info
 {{- end }}
     }
+{{- if not .InPlace }}
 
     chain input {
         type filter hook input priority filter; policy accept;
@@ -143,6 +167,7 @@ table inet hole {
         type nat hook postrouting priority srcnat; policy accept;
         oifname "{INTERNET_IF}" masquerade
     }
+{{- end }}
 }
 `
 
@@ -163,13 +188,14 @@ var (
 	nftablesTmpl = template.Must(template.New("nftables.rules").Funcs(templateFuncs).Parse(nftablesTemplate))
 )
 
-// Generate renders the three gateway configuration files from a policy.
+// Generate renders the gateway configuration files from a policy.
 func (p Policy) Generate() (Artifacts, error) {
 	corefileData := struct {
 		HealthZone   string
 		HostGateway  []HostGatewayDomain
 		PolicyRegex  string
 		Unrestricted bool
+		Generation   string
 	}{
 		HealthZone:   HealthZone,
 		HostGateway:  p.HostGateway,
@@ -177,6 +203,14 @@ func (p Policy) Generate() (Artifacts, error) {
 		Unrestricted: p.Unrestricted,
 	}
 
+	// The marker is a hash of the Corefile rendered without it, so it changes exactly when the
+	// rest of the Corefile does.
+	var unmarked strings.Builder
+	if err := corefileTmpl.Execute(&unmarked, corefileData); err != nil {
+		return Artifacts{}, fmt.Errorf("generate Corefile: %w", err)
+	}
+	sum := sha256.Sum256([]byte(unmarked.String()))
+	corefileData.Generation = hex.EncodeToString(sum[:])[:12]
 	var corefile strings.Builder
 	if err := corefileTmpl.Execute(&corefile, corefileData); err != nil {
 		return Artifacts{}, fmt.Errorf("generate Corefile: %w", err)
@@ -188,7 +222,7 @@ func (p Policy) Generate() (Artifacts, error) {
 	}
 
 	var dnsmasq strings.Builder
-	if err := dnsmasqTmpl.Execute(&dnsmasq, struct{ Groups []Group }{Groups: groups}); err != nil {
+	if err := dnsmasqTmpl.Execute(&dnsmasq, struct{ Rules []nftsetRule }{Rules: nftsetRules(groups)}); err != nil {
 		return Artifacts{}, fmt.Errorf("generate dnsmasq.conf: %w", err)
 	}
 
@@ -200,25 +234,96 @@ func (p Policy) Generate() (Artifacts, error) {
 		hostGatewayPorts = normalizePorts(append(hostGatewayPorts, entry.Ports...))
 	}
 
-	nftData := struct {
-		Groups           []Group
-		Unrestricted     bool
-		HostGatewayPorts []int
-	}{
-		Groups:           groups,
-		Unrestricted:     p.Unrestricted,
-		HostGatewayPorts: hostGatewayPorts,
+	render := func(inPlace bool) (string, error) {
+		nftData := struct {
+			Groups           []Group
+			Unrestricted     bool
+			HostGatewayPorts []int
+			InPlace          bool
+		}{
+			Groups:           groups,
+			Unrestricted:     p.Unrestricted,
+			HostGatewayPorts: hostGatewayPorts,
+			InPlace:          inPlace,
+		}
+		var nftables strings.Builder
+		if err := nftablesTmpl.Execute(&nftables, nftData); err != nil {
+			return "", fmt.Errorf("generate nftables rules: %w", err)
+		}
+		return nftables.String(), nil
 	}
-	var nftables strings.Builder
-	if err := nftablesTmpl.Execute(&nftables, nftData); err != nil {
-		return Artifacts{}, fmt.Errorf("generate nftables rules: %w", err)
+	startRules, err := render(false)
+	if err != nil {
+		return Artifacts{}, err
+	}
+	applyRules, err := render(true)
+	if err != nil {
+		return Artifacts{}, err
 	}
 
 	return Artifacts{
-		Corefile:     corefile.String(),
-		DnsmasqConf:  dnsmasq.String(),
-		NftablesRule: nftables.String(),
+		Corefile:      corefile.String(),
+		DnsmasqConf:   dnsmasq.String(),
+		NftablesRule:  startRules,
+		NftablesApply: applyRules,
+		Generation:    corefileData.Generation,
 	}, nil
+}
+
+// nftsetRule is one dnsmasq `nftset=` line.
+type nftsetRule struct {
+	Key  string
+	Sets []string
+}
+
+// nftsetRules emits one line per domain key. dnsmasq uses exactly one `nftset=` line per query —
+// the longest matching suffix — and an exact `x` and a wildcard `*.x` share the key `x`. Every
+// name routed to key k must therefore feed every set that may permit it: the sets of exact entries
+// for k, and of wildcards whose host is k or a parent of k. The remaining over-grant: every name
+// routed to k feeds all of those sets — the apex addresses of `x` land in the set of `*.x` and vice
+// versa, and a name under an exact key k that only a parent wildcard permits lands in k's exact set
+// too. Such shared lines can feed a base set from a runtime entry's name; that address stays in the
+// base set after the runtime entry is removed.
+func nftsetRules(groups []Group) []nftsetRule {
+	setsByKey := map[string]map[string]bool{}
+	add := func(key, set string) {
+		if setsByKey[key] == nil {
+			setsByKey[key] = map[string]bool{}
+		}
+		setsByKey[key][set] = true
+	}
+	for _, group := range groups {
+		for _, host := range group.Exact {
+			add(host, group.Name)
+		}
+		for _, host := range group.Wildcards {
+			add(host, group.Name)
+		}
+	}
+	for _, group := range groups {
+		for _, wildcard := range group.Wildcards {
+			for key := range setsByKey {
+				if strings.HasSuffix(key, "."+wildcard) {
+					add(key, group.Name)
+				}
+			}
+		}
+	}
+
+	rules := make([]nftsetRule, 0, len(setsByKey))
+	for _, key := range sortedKeys(setsByKey) {
+		rules = append(rules, nftsetRule{Key: key, Sets: sortedKeys(setsByKey[key])})
+	}
+	return rules
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // exprStringLiteral prepares a regex for embedding in a CoreDNS `view` expression. The

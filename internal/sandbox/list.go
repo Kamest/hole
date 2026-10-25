@@ -45,6 +45,8 @@ type listEntry struct {
 	Flags         listFlags `json:"flags"`
 	PID           int       `json:"pid"`
 	Version       string    `json:"version"`
+	// RuntimeEntryCount counts the entries `hole modify` added to the running sandbox.
+	RuntimeEntryCount int `json:"runtimeEntryCount"`
 }
 
 // listFlags is the `flags` object of listEntry, part of the same public contract.
@@ -120,15 +122,16 @@ func filterByInstanceID(instances []*state.Instance, instanceID string) []*state
 
 func writeListTable(out io.Writer, host hostenv.Host, running []*state.Instance) error {
 	writer := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(writer, "INSTANCE\tAGENT\tPROJECT\tUPTIME\tDOCKER\tNETWORK\tSETTINGS")
+	_, _ = fmt.Fprintln(writer, "INSTANCE\tAGENT\tPROJECT\tUPTIME\tDOCKER\tNETWORK\tRUNTIME\tSETTINGS")
 	for _, instance := range running {
-		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
 			instance.InstanceID,
 			agentLabel(instance),
 			instance.ProjectPath,
 			formatUptime(instance.Uptime()),
 			yesNo(instance.DinDEnabled),
 			firstOr(instance.Networks, "-"),
+			runtimeEntryCount(instance),
 			strings.Join(settingsLabels(host, instance), "+"),
 		)
 	}
@@ -161,8 +164,9 @@ func writeListJSON(out io.Writer, host hostenv.Host, store *state.Store, running
 				DumpNetworkAccess: instance.Flags.DumpNetworkAccess,
 				WithDocker:        instance.Flags.WithDocker,
 			},
-			PID:     instance.CLIPID,
-			Version: instance.Version,
+			PID:               instance.CLIPID,
+			Version:           instance.Version,
+			RuntimeEntryCount: runtimeEntryCount(instance),
 		})
 	}
 	data, err := json.MarshalIndent(entries, "", "  ")
@@ -171,6 +175,11 @@ func writeListJSON(out io.Writer, host hostenv.Host, store *state.Store, running
 	}
 	_, err = out.Write(append(data, '\n'))
 	return err
+}
+
+// runtimeEntryCount is how many entries `hole modify` added to a running sandbox.
+func runtimeEntryCount(instance *state.Instance) int {
+	return len(instance.RuntimeAllow) + len(instance.RuntimeHostGatewayDomains)
 }
 
 // instanceStatus is the lifecycle status `hole list --json` reports. The stopping marker wins

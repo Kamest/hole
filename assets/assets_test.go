@@ -28,6 +28,8 @@ func TestEmbeddedTreeIsComplete(t *testing.T) {
 		"gateway/Dockerfile",
 		"gateway/entrypoint.sh",
 		"gateway/hole-bridge-netfilter",
+		"gateway/hole-gateway-apply",
+		"gateway/hole-gateway-lib.sh",
 		"schema/settings.schema.json",
 	}
 	for _, path := range required {
@@ -94,7 +96,8 @@ func TestGatewayEntrypointDropsForwardingFirst(t *testing.T) {
 	}
 	// Any check that can abort or block must sit behind the drop, so the two markers below stand
 	// in for "the rest of startup".
-	for _, marker := range []string{"dnsmasq --version", "/etc/hosts", "ip -o -4 addr show"} {
+	for _, marker := range []string{"source /usr/local/bin/hole-gateway-lib.sh", "dnsmasq --version",
+		"host_gateway_address", "ip -o -4 addr show"} {
 		markerIndex := strings.Index(entrypoint, marker)
 		if markerIndex < 0 {
 			t.Errorf("startup step %q is gone; check that the drop still precedes what replaced it", marker)
@@ -119,20 +122,29 @@ func TestGatewayEntrypointResolvesHostGatewayFromHostsFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	entrypoint := string(data)
+	libData, err := FS.ReadFile("gateway/hole-gateway-lib.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The lookup lives in the library the entrypoint and the apply script share.
+	lib := string(libData)
+	if !strings.Contains(entrypoint, "source /usr/local/bin/hole-gateway-lib.sh") {
+		t.Fatal("the entrypoint no longer sources the shared gateway library")
+	}
 
-	if strings.Contains(entrypoint, "getent hosts host.internal") {
+	if strings.Contains(entrypoint+lib, "getent hosts host.internal") {
 		t.Error("the host gateway address is looked up through getent again, which answers IPv6 first")
 	}
-	if !strings.Contains(entrypoint, "/etc/hosts") {
+	if !strings.Contains(lib, "/etc/hosts") {
 		t.Fatal("the host gateway address is no longer read from /etc/hosts")
 	}
 	// Both names the runtimes use, or Podman's gateway would resolve to nothing.
 	for _, name := range []string{"host.internal", "host.containers.internal"} {
-		if !strings.Contains(entrypoint, name) {
+		if !strings.Contains(lib, name) {
 			t.Errorf("the lookup does not consider %q", name)
 		}
 	}
-	if !strings.Contains(entrypoint, `$1 !~ /:/`) {
+	if !strings.Contains(lib, `$1 !~ /:/`) {
 		t.Error("the lookup no longer rejects IPv6 addresses, which cannot be substituted into the ruleset")
 	}
 
@@ -145,7 +157,7 @@ func TestGatewayEntrypointResolvesHostGatewayFromHostsFile(t *testing.T) {
 	}
 	// Empty, loopback and the unspecified address are the three answers that mean "no host
 	// gateway"; substituting any of them points the configured names at the sandbox itself.
-	if !strings.Contains(entrypoint, `""|127.*|0.0.0.0)`) {
+	if !strings.Contains(lib, `""|127.*|0.0.0.0)`) {
 		t.Error("the set of unusable host gateway addresses changed; empty, loopback and 0.0.0.0 must all abort")
 	}
 }
@@ -185,6 +197,43 @@ func TestBuildInputsHashIgnoresUpdateOnlyFiles(t *testing.T) {
 	for _, path := range []string{"agents/Dockerfile", "agents/claude/install-user.sh", "gateway/version.json"} {
 		if buildInputsHash(changed(path)) == reference {
 			t.Errorf("changing %s did not change the build inputs hash", path)
+		}
+	}
+}
+
+// TestGatewayApplyOrder pins the fail-closed order of a runtime apply: the transitional ruleset
+// (old and new entries) goes in before dnsmasq and CoreDNS learn the new names, and the final
+// ruleset only after CoreDNS stopped resolving removed names.
+func TestGatewayApplyOrder(t *testing.T) {
+	data, err := FS.ReadFile("gateway/hole-gateway-apply")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	body := script[strings.Index(script, "apply_config() {"):]
+	steps := []string{`nft -f "${open_rules}"`, "restart_dnsmasq", "reload_coredns", `nft -f "${final_rules}"`,
+		"delete_unused_sets"}
+	previous := -1
+	for _, step := range steps {
+		index := strings.Index(body, step)
+		if index < 0 {
+			t.Fatalf("apply step %q is gone", step)
+		}
+		if index < previous {
+			t.Errorf("apply step %q runs out of order", step)
+		}
+		previous = index
+	}
+	// Validation precedes every change, and persistence follows a successful apply only.
+	validate := strings.Index(script, `nft -c -f "${staging}/final.nft.resolved"`)
+	firstApply := strings.Index(script, `if ! apply_config`)
+	persist := strings.Index(script, `mv -T "${HOLE_STATE_DIR}/runtime.tmp"`)
+	if validate < 0 || firstApply < 0 || persist < 0 || validate > firstApply || firstApply > persist {
+		t.Error("the apply script no longer validates first and persists last")
+	}
+	for _, forbidden := range []string{"flush set", "destroy set"} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("the apply script uses %q, which fails on a missing set or an older kernel", forbidden)
 		}
 	}
 }

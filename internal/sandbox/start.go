@@ -245,9 +245,16 @@ func Start(opts Options) (exitCode int, err error) {
 	hookEnv := hookEnvironment(host, instance)
 	hookLogDir := hooks.RunLogDir(opts.LogFile)
 
-	policy, err := buildPolicy(settings, enabledAgents, opts.Unrestricted)
+	policy, base, err := buildPolicy(settings, enabledAgents, opts.Unrestricted)
 	if err != nil {
 		return 1, err
+	}
+	// Recorded before the gateway exists, so `hole modify` re-renders from what this run started
+	// with, never from settings files or allow.txt that may change while it runs.
+	instance.BaseAllow = base.allow
+	instance.BaseHostGatewayDomains = base.hostGateway
+	if err := store.Write(instance); err != nil {
+		logging.Warn("could not update the instance registry: %v", err)
 	}
 
 	setupScripts := hooks.Resolve(settings.Hooks.Setup, host, opts.ProjectDir, "setup")
@@ -774,45 +781,57 @@ func loadSettingsDocument(host hostenv.Host, projectDir, profile string) (settin
 	return documents, nil
 }
 
+// basePolicy is the allow list a sandbox starts with, in the canonical form state records.
+type basePolicy struct {
+	allow       []state.SourcedEntry
+	hostGateway []string
+}
+
 // buildPolicy folds every allow-list source into the gateway policy: each enabled agent's
 // built-in entries plus the user's (1.x) whitelist keys, translated into the host×ports
-// model.
-func buildPolicy(settings *config.Settings, enabledAgents []*agents.Agent, unrestricted bool) (network.Policy, error) {
+// model. It also returns the entries with their sources, for `hole modify`.
+func buildPolicy(settings *config.Settings, enabledAgents []*agents.Agent, unrestricted bool) (network.Policy, basePolicy, error) {
 	var entries []network.Entry
+	base := basePolicy{allow: []state.SourcedEntry{}}
 	for _, agent := range enabledAgents {
 		content, err := agent.AllowFile()
 		if err != nil {
-			return network.Policy{}, err
+			return network.Policy{}, basePolicy{}, err
 		}
 		parsed, err := network.ParseAllowFile(content, fmt.Sprintf("agent '%s' allow.txt", agent.Name))
 		if err != nil {
-			return network.Policy{}, err
+			return network.Policy{}, basePolicy{}, err
 		}
 		entries = append(entries, parsed...)
+		for _, entry := range parsed {
+			base.allow = append(base.allow, state.SourcedEntry{Entry: entry.String(), Source: sourceAgentPrefix + agent.Name})
+		}
 	}
 
 	for _, raw := range settings.Network.Allow {
 		entry, err := network.ParseEntry(raw)
 		if err != nil {
-			return network.Policy{}, err
+			return network.Policy{}, basePolicy{}, err
 		}
 		entries = append(entries, entry)
+		base.allow = append(base.allow, state.SourcedEntry{Entry: entry.String(), Source: SourceSettings})
 	}
 
 	var hostGateway []network.HostGatewayDomain
 	for _, raw := range settings.Network.HostGatewayDomains {
 		parsed, err := network.ParseHostGatewayDomain(raw)
 		if err != nil {
-			return network.Policy{}, err
+			return network.Policy{}, basePolicy{}, err
 		}
 		if parsed.Domain == "localhost" || parsed.Domain == "127.0.0.1" {
 			logging.Warn("hostGatewayDomains entry '%s' cannot work: inside the container that name is "+
 				"the container itself. Use 'host.internal:%d' instead.", raw, parsed.Ports[0])
 		}
 		hostGateway = append(hostGateway, parsed)
+		base.hostGateway = append(base.hostGateway, parsed.String())
 	}
 
-	return network.BuildPolicy(entries, hostGateway, unrestricted), nil
+	return network.BuildPolicy(entries, nil, hostGateway, unrestricted), base, nil
 }
 
 // resolveImage decides which image the run uses: the shared one, or a project-specific one.
@@ -1087,7 +1106,7 @@ func writeGatewayArtifacts(runTmpDir string, policy network.Policy) (string, err
 		return "", fmt.Errorf("create gateway build context: %w", err)
 	}
 	gatewayAssets := assets.Gateway()
-	for _, name := range []string{"Dockerfile", "entrypoint.sh", "hole-bridge-netfilter"} {
+	for _, name := range []string{"Dockerfile", "entrypoint.sh", "hole-bridge-netfilter", "hole-gateway-apply", "hole-gateway-lib.sh"} {
 		data, err := fs.ReadFile(gatewayAssets, name)
 		if err != nil {
 			return "", fmt.Errorf("read embedded gateway %s: %w", name, err)

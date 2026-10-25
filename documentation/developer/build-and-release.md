@@ -123,7 +123,7 @@ It also removes `~/.local/share/hole/` if a 1.x tarball install is still there.
 
 `CGO_ENABLED=0 go install github.com/lukashornych/hole/v2/cmd/hole@latest` is the source alternative
 to the installer, and works because the module has no non-Go build step: every runtime file is
-`go:embed`-ed and the two dependencies are pure Go. `go.mod` declares `go 1.27`, which an older
+`go:embed`-ed and every dependency is pure Go. `go.mod` declares `go 1.27`, which an older
 toolchain satisfies by downloading `go1.27.x` on the spot unless `GOTOOLCHAIN=local` forbids it.
 
 The `CGO_ENABLED=0` is not decoration. `make build` and GoReleaser both set it; `go install` instead
@@ -296,7 +296,11 @@ depends on kernel and packaging details CI does not vary:
 - `nft -f` accepted the ruleset (a failure kills the gateway container, so startup aborts):
   `docker exec <instance>-gateway-1 nft list ruleset`.
 - dnsmasq actually populates the sets: resolve an allowed name, then
-  `nft list set inet hole g0`.
+  `nft list table inet hole` (sets are named `b_<hash>`/`r_<hash>`).
 - `sysctls` and `cap_add` accepted by the runtime, and on rootless podman that `nft` may be loaded
   as the userns owner.
+- `hole modify . network.allow add <name>` in a running sandbox: the name resolves from inside it
+  at once, an open connection survives the change, `list-blocked` shows a refused name, and the
+  `edit` editor renders, resizes and restores the terminal on Ctrl-C (macOS Terminal and a Linux
+  terminal).
 - Teardown leaves nothing: `hole list` empty, no `hole-sandbox-*` containers or networks.

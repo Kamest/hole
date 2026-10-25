@@ -18,10 +18,20 @@ table inet hole {
 }
 EOF
 
-# Runtime-mounted, generated per run by internal/network.
-COREFILE_TEMPLATE=/etc/hole/Corefile
-DNSMASQ_CONF=/etc/hole/dnsmasq.conf
-NFT_TEMPLATE=/etc/hole/nftables.rules
+# shellcheck source=hole-gateway-lib.sh
+source /usr/local/bin/hole-gateway-lib.sh
+
+# Generated per run by internal/network and mounted read-only — unless a runtime change
+# (`hole modify`) stored a newer configuration in this container, which then survives a restart
+# of the container (`restart: on-failure`).
+source_dir=/etc/hole
+if runtime_config_present; then
+  source_dir="${HOLE_RUNTIME_DIR}"
+  echo "Restoring the configuration of the last runtime change"
+fi
+COREFILE_TEMPLATE="${source_dir}/Corefile"
+DNSMASQ_CONF="${source_dir}/dnsmasq.conf"
+NFT_TEMPLATE="${source_dir}/nftables.rules"
 
 # The sandbox subnet is passed in so interfaces can be identified by address instead of by
 # name — compose does not guarantee eth0/eth1 ordering across the two networks.
@@ -39,25 +49,17 @@ if ! grep -q '[^-]nftset' <<<"${dnsmasq_version}"; then
   exit 1
 fi
 
-# The address the runtime injects for `host-gateway` lives in /etc/hosts, and it is read from there
-# rather than through getent: a runtime that injects both an IPv4 and an IPv6 entry (OrbStack) makes
-# glibc answer with the IPv6 one, and an IPv4-only filter is then left with nothing.
-# `host.containers.internal` is Podman's built-in name for the same address.
-host_gateway_ip="$(awk '$1 !~ /:/ {
-    for (i = 2; i <= NF; i++)
-      if ($i == "host.internal" || $i == "host.containers.internal") { print $1; exit }
-  }' /etc/hosts)"
+# Read from /etc/hosts, never through getent (see hole-gateway-lib.sh).
+host_gateway_ip="$(host_gateway_address)"
 
 # A host gateway zone exists exactly when the generated Corefile carries the placeholder, so the
 # entrypoint needs no extra signal from compose — and cannot drift out of sync with the policy.
 if grep -q '{HOST_GATEWAY_IP}' "${COREFILE_TEMPLATE}"; then
-  case "${host_gateway_ip}" in
-    ""|127.*|0.0.0.0)
-      echo "ERROR: no usable IPv4 host gateway address in /etc/hosts (found '${host_gateway_ip:-none}');" >&2
-      echo "       network.hostGatewayDomains cannot work on this container runtime" >&2
-      exit 1
-      ;;
-  esac
+  if ! usable_host_gateway "${host_gateway_ip}"; then
+    echo "ERROR: no usable IPv4 host gateway address in /etc/hosts (found '${host_gateway_ip:-none}');" >&2
+    echo "       network.hostGatewayDomains cannot work on this container runtime" >&2
+    exit 1
+  fi
 elif [[ -z "${host_gateway_ip}" ]]; then
   # Never leave the placeholder in the rules: an unresolved host gateway must not turn into
   # a syntactically valid rule pointing somewhere unintended.
@@ -85,8 +87,9 @@ fi
 
 echo "Gateway interfaces: sandbox=${sandbox_if} internet=${internet_if}, host gateway=${host_gateway_ip}"
 
-mkdir -p /tmp/hole
-sed -e "s/{HOST_GATEWAY_IP}/${host_gateway_ip}/g" "${COREFILE_TEMPLATE}" > /tmp/hole/Corefile
+mkdir -p "${HOLE_RUN_DIR}"
+substitute_host_gateway "${COREFILE_TEMPLATE}" "${HOLE_RUN_DIR}/Corefile" "${host_gateway_ip}"
+cp "${DNSMASQ_CONF}" "${HOLE_RUN_DIR}/dnsmasq.conf"
 sed -e "s/{HOST_GATEWAY_IP}/${host_gateway_ip}/g" \
     -e "s/{SANDBOX_IF}/${sandbox_if}/g" \
     -e "s/{INTERNET_IF}/${internet_if}/g" \
@@ -95,9 +98,17 @@ sed -e "s/{HOST_GATEWAY_IP}/${host_gateway_ip}/g" \
 nft -f /tmp/hole/nftables.rules
 
 # dnsmasq resolves only what CoreDNS already approved and records the answers in nftables sets.
-dnsmasq --conf-file="${DNSMASQ_CONF}" --keep-in-foreground &
-dnsmasq_pid=$!
+# It runs under a supervising loop so a runtime change can restart it with a new configuration
+# (it cannot reload nftset lines), and so a crashed dnsmasq comes back. The kernel sets survive
+# the restart; the short sleep keeps a dnsmasq that dies at once from spinning.
+(
+  set +e
+  while :; do
+    dnsmasq --conf-file="${HOLE_RUN_DIR}/dnsmasq.conf" --keep-in-foreground &
+    echo "$!" > "${HOLE_DNSMASQ_PID}"
+    wait "$!"
+    sleep 0.2
+  done
+) &
 
-trap 'kill "${dnsmasq_pid}" 2>/dev/null || true' TERM INT
-
-exec coredns -conf /tmp/hole/Corefile
+exec coredns -conf "${HOLE_RUN_DIR}/Corefile"
