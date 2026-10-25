@@ -279,11 +279,13 @@ support. That is all — Hole embeds everything else it needs. An older engine s
 [excluded directories](#file-exclusions) are then held in memory instead of on disk, and Hole warns
 about it on every start.
 
-Supported platforms: Linux (amd64/arm64, including WSL) and macOS (Intel/Apple Silicon).
+Supported platforms: Linux (amd64/arm64, including WSL) and macOS 13 Ventura or later (Intel/Apple
+Silicon). On macOS 12 stay on the last release built before Go 1.27 — `hole update` does not check
+the OS version and would install a binary that does not start.
 
 ### Install with `go install`
 
-With a Go 1.25+ toolchain you can build Hole from source instead of downloading a release:
+With a Go 1.27+ toolchain you can build Hole from source instead of downloading a release:
 
 ```sh
 CGO_ENABLED=0 go install github.com/lukashornych/hole/v2/cmd/hole@latest

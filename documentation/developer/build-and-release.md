@@ -100,7 +100,9 @@ release with no assets — recoverable by re-running the job, but worth knowing.
 
 `.goreleaser.yaml` produces `linux_amd64`, `linux_arm64` (which covers WSL), `darwin_amd64` and
 `darwin_arm64` as **raw binaries** named `hole_<os>_<arch>`, plus `checksums.txt`. Raw rather than
-archives so neither the installer nor self-update has an unpacking step.
+archives so neither the installer nor self-update has an unpacking step. The darwin binaries need
+macOS 13 Ventura or later, the minimum of the Go 1.27 toolchain they are built with; self-update does
+not check the OS version.
 
 `internal/update.BinaryAssetName` and the installer's asset name must stay in step with that
 template; a unit test asserts both.
@@ -121,8 +123,8 @@ It also removes `~/.local/share/hole/` if a 1.x tarball install is still there.
 
 `CGO_ENABLED=0 go install github.com/lukashornych/hole/v2/cmd/hole@latest` is the source alternative
 to the installer, and works because the module has no non-Go build step: every runtime file is
-`go:embed`-ed and the two dependencies are pure Go. `go.mod` declares `go 1.25`, which an older
-toolchain satisfies by downloading `go1.25.x` on the spot unless `GOTOOLCHAIN=local` forbids it.
+`go:embed`-ed and the two dependencies are pure Go. `go.mod` declares `go 1.27`, which an older
+toolchain satisfies by downloading `go1.27.x` on the spot unless `GOTOOLCHAIN=local` forbids it.
 
 The `CGO_ENABLED=0` is not decoration. `make build` and GoReleaser both set it; `go install` instead
 inherits the environment, and on a machine with a C toolchain the default `CGO_ENABLED=1` gives

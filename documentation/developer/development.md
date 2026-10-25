@@ -8,11 +8,11 @@ conventions the code must follow, see [guidelines](guidelines.md); for task-shap
 
 | Tool | Needed for | Notes |
 |---|---|---|
-| **Go 1.25+** | everything | `go.mod` declares `go 1.25` and pins no `toolchain`, so any newer release works. Builds are `CGO_ENABLED=0`, so no C compiler is required. |
+| **Go 1.27+** | everything | `go.mod` declares `go 1.27` and pins no `toolchain`, so any newer release works. Builds are `CGO_ENABLED=0`, so no C compiler is required. |
 | **make** | the documented entry points | Every target is a one-line `go` invocation; you can run them by hand if you prefer. |
 | **git** | the checkout, and part of the unit suite | `internal/worktree` shells out to `git`; its tests skip without it. |
 | **docker or podman + the compose plugin** | `make itest`, `make e2e`, manual runs | Hole's own runtime requirement, see the [README](../../README.md#installation). `engine.Detect` verifies `<binary> compose version` works, not just that the binary exists. |
-| **golangci-lint** | optional, part of `make lint` | The repo ships **no** `.golangci.yml`, so the linter runs on its defaults. CI uses `version: latest`; a pinned older local install can therefore disagree with CI. |
+| **golangci-lint** | optional, part of `make lint` | The repo ships **no** `.golangci.yml`, so the linter runs on its defaults. CI pins a version; `.hole/setup.sh` installs the same one, so a different local install can disagree with CI. |
 | **goreleaser** | optional | Only to reproduce the `release-config` CI job locally — see [build & release](build-and-release.md). |
 
 Dependencies of the Go module itself are deliberately two — `gopkg.in/yaml.v3` and
@@ -255,7 +255,7 @@ The `release-config` job is the one developers most often forget — why it exis
 | `sandbox left containers behind` naming an instance from an earlier run | orphans from a previously aborted run; the assertion prints resource *names*, so compare the instance ID in the name against the run you just did, then clear them with `./hole destroy` |
 | Golden test fails after an unrelated change | map iteration reached generated output unsorted — see `config.SortedKeys` in [guidelines](guidelines.md#go-conventions) |
 | `go vet` clean locally, CI lint red | you ran `go vet ./...` only; CI also vets the `integration` and `e2e` tags |
-| `golangci-lint` clean locally, CI lint red | there is no `.golangci.yml`; CI uses `latest` and your local install may be older |
+| `golangci-lint` clean locally, CI lint red | there is no `.golangci.yml`; CI pins a version (`.hole/setup.sh` installs the same one) and your local install may differ |
 
 For debugging an actual sandbox run rather than the test suites, see
 [recipes § Debug a failing sandbox](recipes.md#debug-a-failing-sandbox).

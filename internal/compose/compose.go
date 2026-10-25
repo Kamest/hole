@@ -147,7 +147,7 @@ func Marshal(file *File) ([]byte, error) {
 
 func escapeInterpolation(value reflect.Value) {
 	switch value.Kind() {
-	case reflect.Ptr, reflect.Interface:
+	case reflect.Pointer, reflect.Interface:
 		if !value.IsNil() {
 			escapeInterpolation(value.Elem())
 		}
