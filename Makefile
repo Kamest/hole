@@ -1,6 +1,6 @@
 # Build and test entry points for the Go implementation.
 #
-# Requirements: Go 1.25+. The integration and e2e suites additionally need a working
+# Requirements: Go 1.27+. The integration and e2e suites additionally need a working
 # docker or podman with the compose plugin.
 
 BINARY  ?= hole

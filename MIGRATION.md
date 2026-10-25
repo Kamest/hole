@@ -70,7 +70,7 @@ Either the installer:
 curl -fsSL https://raw.githubusercontent.com/lukashornych/hole/main/install.sh | bash
 ```
 
-or, with a Go 1.25+ toolchain, build it from source instead:
+or, with a Go 1.27+ toolchain, build it from source instead:
 
 ```sh
 CGO_ENABLED=0 go install github.com/lukashornych/hole/v2/cmd/hole@latest

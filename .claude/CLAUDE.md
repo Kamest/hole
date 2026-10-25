@@ -13,7 +13,7 @@ Gemini CLI, Codex CLI, plus user-defined agents). It provides:
 
 All enabled agents are installed into a single unified sandbox image.
 
-Technology stack: Go 1.25 (single static binary, `CGO_ENABLED=0`), Docker Compose (docker or
+Technology stack: Go 1.27 (single static binary, `CGO_ENABLED=0`), Docker Compose (docker or
 podman), CoreDNS + dnsmasq + nftables inside the gateway container. Two Go libraries:
 `gopkg.in/yaml.v3` and `github.com/santhosh-tekuri/jsonschema/v6`. Everything else is stdlib.
 

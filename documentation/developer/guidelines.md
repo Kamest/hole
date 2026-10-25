@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-Go 1.25+, module `github.com/lukashornych/hole/v2` (the suffix is required for a 2.x module and is
+Go 1.27+, module `github.com/lukashornych/hole/v2` (the suffix is required for a 2.x module and is
 what makes `go install` work — see
 [build & release](build-and-release.md#why-the-module-path-carries-v2)), `CGO_ENABLED=0`. Two
 libraries, each replacing an
