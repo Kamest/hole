@@ -11,6 +11,7 @@ everything when the agent exits.
 cmd/hole/              thin entry point: logging setup, dispatch to internal/cli
 assets/                go:embed root — agent plugins, Dockerfiles, entrypoints, schema
 internal/cli/          argument parsing, help text, command dispatch
+internal/modifyui/     the `hole modify … edit` editor — the only package that uses tview
 internal/config/       settings load/validate/merge, profiles, exclusion glob matcher,
                        settings scaffolding
 internal/hostenv/      env expansion, path pipeline, host identity, ~/.hole layout, identity
@@ -21,7 +22,7 @@ internal/agents/       agent registry: embedded builtins + ~/.hole/agents user a
 internal/image/        canonical image config, manifest hashing, image identity and scope
 internal/hooks/        hook script resolution and host-side execution
 internal/sandbox/      orchestration: startup, mounts, compose generation, teardown, dump,
-                       the watchdog handoff, garbage collection, `hole list`
+                       the watchdog handoff, garbage collection, `hole list`, `hole modify`
 internal/state/        instance registry under ~/.hole/instances
 internal/trust/        per-project consent for host-affecting project settings
 internal/worktree/     git worktree detection: the libraries it implies and the worktree pool
@@ -270,6 +271,13 @@ volume, the run directory and log file, the start time, and the lifecycle `phase
 then `running`; absent in files of older versions). Writes are atomic (temp file + rename) so a
 reader never sees half a file.
 
+It also records the egress policy the sandbox started with, for `hole modify`: `baseAllow` (each
+entry in canonical form with its source, `settings` or `agent:<name>`) and `baseHostGatewayDomains`,
+written by `Start` right after the policy is built and before the gateway exists; plus the
+`runtimeAllow` and `runtimeHostGatewayDomains` lists `hole modify` maintains. `baseAllow` is never
+omitted — `[]` when empty — so `nil` after reading reliably means "started by a Hole without
+`hole modify`", which `modify` refuses (exit 3, restart the sandbox).
+
 Next to it live small sidecar files: `.alive` (the liveness lock), `.lock` (the teardown lock),
 `.abort` (the CLI asks the watchdog to tear down now) and `.stopping`. **Stopping is a marker, not
 a phase value**: the CLI's signal goroutine must record it, but the main goroutine owns the
@@ -389,6 +397,25 @@ Image GC is separate and runs only *after* the agent service is up — never bef
 build could have destroyed the last working image. See
 [configuration](configuration.md#image-identity-and-scope).
 
+### Runtime changes and the instance lock
+
+`hole modify` ([networking](networking.md#runtime-changes-hole-modify)) writes the instance state
+of a sandbox it does not own, so it serializes with teardown through the per-instance teardown
+lock — taken **blocking**, because a modify racing a teardown must wait for it and then report the
+sandbox as gone. Before taking it, `modify` checks the instance *without* the lock and refuses
+(exit 3) one that is `Abandoned`, still `starting`, stopping or teardown-requested; under the lock
+it re-reads the state and checks the same conditions again, plus that the state file still exists.
+The unlocked pre-check matters: `recordPhase` and `markStopping` use `tryLockInstance` and *skip*
+their write when the lock is busy, so a modify holding the lock during the `starting → running`
+transition could leave the sandbox reported as `starting` forever. Once `running` is recorded no
+other phase write remains (teardown marks stopping itself).
+
+The change is a delta (values to add and remove), recomputed against the re-read state under the
+lock, so two concurrent modifies cannot overwrite each other. State with the new runtime lists is
+written **before** the gateway apply; on a failed apply the previous lists are written back
+(exit 4). A crash in between leaves state ahead of the gateway, which the next apply repairs,
+because every apply sends the complete configuration.
+
 ## `hole list --json` is a public contract
 
 The JSON output is consumed by other programs (the JetBrains plugin first), which detect support
@@ -397,7 +424,10 @@ by running it once and rely on its fields from then on. It is built from its own
 refactored freely, the list schema cannot. Fields are only ever added, never renamed or removed.
 `status` is derived at listing time (`instanceStatus`: marker, then phase, legacy → `running`),
 `settings` is the slice the table joins with `+` (a path can contain `+`, so it is never split
-from a string), and `networks`/`settingsFiles` are `[]`, never `null`. Logging goes to stderr, so
+from a string), and `networks`/`settingsFiles` are `[]`, never `null`. `runtimeEntryCount` is read
+from the state only (`len(runtimeAllow) + len(runtimeHostGatewayDomains)`), never from the gateway.
+The `hole modify … list --json` and `list-blocked --json` documents follow the same rules
+(`internal/cli/modify.go`). Logging goes to stderr, so
 stdout carries only the document, encoded completely before anything is written.
 
 ## Destroy

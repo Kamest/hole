@@ -33,7 +33,7 @@ func TestGenerateGoldenArtifacts(t *testing.T) {
 				"api.anthropic.com",
 				"claude.ai",
 				"*.claude.ai",
-			), nil, false),
+			), nil, nil, false),
 		},
 		{
 			name: "mixed",
@@ -44,11 +44,11 @@ func TestGenerateGoldenArtifacts(t *testing.T) {
 				"github.com:22,443",
 				"10.0.0.5:22,2222",
 				"192.168.1.0/24:8080",
-			), []HostGatewayDomain{{Domain: "mydb.local", Ports: []int{5432}}}, false),
+			), nil, []HostGatewayDomain{{Domain: "mydb.local", Ports: []int{5432}}}, false),
 		},
 		{
 			name: "host-gateway-ports",
-			policy: BuildPolicy(entries(t, "api.github.com"),
+			policy: BuildPolicy(entries(t, "api.github.com"), nil,
 				[]HostGatewayDomain{{Domain: "mydb.local", Ports: []int{5432, 8080}}}, false),
 		},
 		{
@@ -58,23 +58,56 @@ func TestGenerateGoldenArtifacts(t *testing.T) {
 			policy: BuildPolicy(entries(t,
 				"10.0.0.0/24:443",
 				"10.0.0.5:443",
-			), nil, false),
+			), nil, nil, false),
 		},
 		{
 			// Two entries for one domain: CoreDNS refuses a Corefile that defines a zone twice.
 			name: "duplicate-host-gateway",
-			policy: BuildPolicy(entries(t, "api.github.com"), []HostGatewayDomain{
+			policy: BuildPolicy(entries(t, "api.github.com"), nil, []HostGatewayDomain{
 				{Domain: "app.test", Ports: []int{8080}},
 				{Domain: "app.test", Ports: []int{9090}},
 			}, false),
 		},
 		{
 			name:   "empty",
-			policy: BuildPolicy(nil, nil, false),
+			policy: BuildPolicy(nil, nil, nil, false),
 		},
 		{
 			name:   "unrestricted",
-			policy: BuildPolicy(entries(t, "api.github.com"), nil, true),
+			policy: BuildPolicy(entries(t, "api.github.com"), nil, nil, true),
+		},
+		{
+			// A runtime exact entry under a base wildcard gets its own key, which must feed the
+			// wildcard's set too, or the wildcard's ports would be lost for that name.
+			name:   "runtime-under-base-wildcard",
+			policy: BuildPolicy(entries(t, "*.github.com"), entries(t, "api.github.com:8443"), nil, false),
+		},
+		{
+			// A runtime port variant of a base host is a separate runtime set; the base set is untouched.
+			name:   "runtime-port-variant",
+			policy: BuildPolicy(entries(t, "github.com:22,443"), entries(t, "github.com:80"), nil, false),
+		},
+		{
+			// An exact and a wildcard entry share the dnsmasq key, so one line carries both sets.
+			name:   "runtime-wildcard-over-base-exact",
+			policy: BuildPolicy(entries(t, "github.com"), entries(t, "*.github.com"), nil, false),
+		},
+		{
+			name: "runtime-statics",
+			policy: BuildPolicy(entries(t, "10.0.0.5:443"),
+				entries(t, "10.0.0.0/24:443", "192.168.1.7:443"), nil, false),
+		},
+		{
+			// A runtime port added to a base host gateway zone folds into one zone.
+			name: "runtime-host-gateway",
+			policy: BuildPolicy(entries(t, "api.github.com"), nil, []HostGatewayDomain{
+				{Domain: "mydb.local", Ports: []int{5432}},
+				{Domain: "mydb.local", Ports: []int{8080}},
+			}, false),
+		},
+		{
+			name:   "runtime-unrestricted",
+			policy: BuildPolicy(entries(t, "api.github.com"), entries(t, "example.com"), nil, true),
 		},
 	}
 
@@ -88,6 +121,7 @@ func TestGenerateGoldenArtifacts(t *testing.T) {
 				"Corefile":       artifacts.Corefile,
 				"dnsmasq.conf":   artifacts.DnsmasqConf,
 				"nftables.rules": artifacts.NftablesRule,
+				"nftables.apply": artifacts.NftablesApply,
 			}
 			for name, content := range files {
 				golden := filepath.Join("testdata", test.name, name)
@@ -113,7 +147,7 @@ func TestGenerateGoldenArtifacts(t *testing.T) {
 }
 
 func TestGenerateIsDeterministic(t *testing.T) {
-	policy := BuildPolicy(entries(t, "b.example.com:443", "a.example.com:443", "10.0.0.1:22"), nil, false)
+	policy := BuildPolicy(entries(t, "b.example.com:443", "a.example.com:443", "10.0.0.1:22"), nil, nil, false)
 	first, err := policy.Generate()
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +164,7 @@ func TestGenerateIsDeterministic(t *testing.T) {
 }
 
 func TestGeneratedNftablesDropsByDefault(t *testing.T) {
-	artifacts, err := BuildPolicy(entries(t, "api.github.com"), nil, false).Generate()
+	artifacts, err := BuildPolicy(entries(t, "api.github.com"), nil, nil, false).Generate()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +180,7 @@ func TestGeneratedNftablesDropsByDefault(t *testing.T) {
 }
 
 func TestGeneratedUnrestrictedAcceptsEverything(t *testing.T) {
-	artifacts, err := BuildPolicy(entries(t, "api.github.com"), nil, true).Generate()
+	artifacts, err := BuildPolicy(entries(t, "api.github.com"), nil, nil, true).Generate()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +199,7 @@ func TestGeneratedUnrestrictedAcceptsEverything(t *testing.T) {
 }
 
 func TestGeneratedEmptyPolicyDeniesEverything(t *testing.T) {
-	artifacts, err := BuildPolicy(nil, nil, false).Generate()
+	artifacts, err := BuildPolicy(nil, nil, nil, false).Generate()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,14 +209,14 @@ func TestGeneratedEmptyPolicyDeniesEverything(t *testing.T) {
 	if !contains(artifacts.Corefile, "NXDOMAIN") {
 		t.Error("an empty policy must still answer NXDOMAIN")
 	}
-	if contains(artifacts.NftablesRule, "@g0") {
+	if contains(artifacts.NftablesRule, "ip daddr @") {
 		t.Error("an empty policy must not reference any set")
 	}
 }
 
 func TestGeneratedHealthZoneIsAlwaysResolvable(t *testing.T) {
 	for _, unrestricted := range []bool{false, true} {
-		artifacts, err := BuildPolicy(nil, nil, unrestricted).Generate()
+		artifacts, err := BuildPolicy(nil, nil, nil, unrestricted).Generate()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -206,13 +240,13 @@ func TestGeneratedHealthZoneIsAlwaysResolvable(t *testing.T) {
 // which is where the exposure lived.
 func TestGeneratedRulesNeverAcceptAllHostGatewayPorts(t *testing.T) {
 	policies := map[string]Policy{
-		"single host gateway entry": BuildPolicy(nil,
+		"single host gateway entry": BuildPolicy(nil, nil,
 			[]HostGatewayDomain{{Domain: "mydb.local", Ports: []int{5432}}}, false),
-		"several entries": BuildPolicy(entries(t, "api.github.com"), []HostGatewayDomain{
+		"several entries": BuildPolicy(entries(t, "api.github.com"), nil, []HostGatewayDomain{
 			{Domain: "mydb.local", Ports: []int{5432}},
 			{Domain: "myapi.local", Ports: []int{8080, 8443}},
 		}, false),
-		"no host gateway entries": BuildPolicy(entries(t, "api.github.com"), nil, false),
+		"no host gateway entries": BuildPolicy(entries(t, "api.github.com"), nil, nil, false),
 	}
 	for name, policy := range policies {
 		t.Run(name, func(t *testing.T) {
@@ -228,7 +262,7 @@ func TestGeneratedRulesNeverAcceptAllHostGatewayPorts(t *testing.T) {
 }
 
 func TestGeneratedSetsMatchDnsmasqReferences(t *testing.T) {
-	policy := BuildPolicy(entries(t, "a.example.com:443", "db.example.com:5432", "10.0.0.0/8:9000"), nil, false)
+	policy := BuildPolicy(entries(t, "a.example.com:443", "db.example.com:5432", "10.0.0.0/8:9000"), nil, nil, false)
 	artifacts, err := policy.Generate()
 	if err != nil {
 		t.Fatal(err)
@@ -236,7 +270,7 @@ func TestGeneratedSetsMatchDnsmasqReferences(t *testing.T) {
 	// Every set dnsmasq writes into must be declared in the ruleset, or nft rejects the
 	// insert at runtime.
 	for _, group := range policy.Groups {
-		if len(group.Domains) == 0 {
+		if !group.HasDomains() {
 			continue
 		}
 		if !contains(artifacts.DnsmasqConf, "#inet#hole#"+group.Name) {
@@ -249,5 +283,43 @@ func TestGeneratedSetsMatchDnsmasqReferences(t *testing.T) {
 	// A group holding only literal addresses gets a static set and no dnsmasq line.
 	if !contains(artifacts.NftablesRule, "_static {") {
 		t.Error("literal IP/CIDR entries must land in a static interval set")
+	}
+}
+
+// The in-place ruleset is applied to a running gateway: it must neither re-create the table
+// (which would drop every recorded address and open connection's state) nor touch the chains
+// whose interface placeholders only the entrypoint can substitute.
+func TestGeneratedInPlaceRulesetKeepsTable(t *testing.T) {
+	artifacts, err := BuildPolicy(entries(t, "api.github.com", "10.0.0.1"), entries(t, "example.com:8080"),
+		nil, false).Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"delete table", "flush set", "destroy", "chain input", "chain postrouting",
+		"{SANDBOX_IF}", "{INTERNET_IF}"} {
+		if contains(artifacts.NftablesApply, forbidden) {
+			t.Errorf("in-place ruleset contains %q:\n%s", forbidden, artifacts.NftablesApply)
+		}
+	}
+	if !contains(artifacts.NftablesApply, "flush chain inet hole forward") {
+		t.Error("in-place ruleset does not replace the forward chain")
+	}
+}
+
+// The generation marker is how an apply confirms that CoreDNS reloaded the new Corefile.
+func TestGeneratedCorefileGenerationTracksContent(t *testing.T) {
+	first, err := BuildPolicy(entries(t, "api.github.com"), nil, nil, false).Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := BuildPolicy(entries(t, "api.github.com"), entries(t, "example.com"), nil, false).Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Generation == "" || first.Generation == second.Generation {
+		t.Errorf("generations %q and %q do not tell the Corefiles apart", first.Generation, second.Generation)
+	}
+	if !contains(first.Corefile, `IN TXT \"`+first.Generation+`\"`) {
+		t.Errorf("Corefile does not answer its generation:\n%s", first.Corefile)
 	}
 }

@@ -5,6 +5,9 @@ health.hole.internal:53 {
     template IN AAAA health.hole.internal {
         rcode NOERROR
     }
+    template IN TXT health.hole.internal {
+        answer "{{ .Name }} 0 IN TXT \"c7d142c30e03\""
+    }
     errors
 }
 

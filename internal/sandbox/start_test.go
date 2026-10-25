@@ -18,7 +18,7 @@ import (
 // runtime (regression: hole-bridge-netfilter was embedded but never written).
 func TestWriteGatewayArtifactsMaterializesEveryDockerfileCopySource(t *testing.T) {
 	runTmpDir := t.TempDir()
-	if _, err := writeGatewayArtifacts(runTmpDir, network.BuildPolicy(nil, nil, false)); err != nil {
+	if _, err := writeGatewayArtifacts(runTmpDir, network.BuildPolicy(nil, nil, nil, false)); err != nil {
 		t.Fatalf("writeGatewayArtifacts: %v", err)
 	}
 

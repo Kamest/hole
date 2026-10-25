@@ -92,6 +92,18 @@ type Instance struct {
 	BridgeFilterBackend string `json:"bridgeFilterBackend,omitempty"`
 	BridgeFilterPhysdev bool   `json:"bridgeFilterPhysdev,omitempty"`
 
+	// BaseAllow is the allow list the sandbox started with, each entry with its source
+	// (`settings` or `agent:<name>`), so `hole modify` never depends on settings files or agents'
+	// allow.txt changing mid-run. Never omitted: nil after reading means the instance was started
+	// by a Hole without `hole modify`.
+	BaseAllow []SourcedEntry `json:"baseAllow"`
+	// BaseHostGatewayDomains are the network.hostGatewayDomains entries the sandbox started with.
+	BaseHostGatewayDomains []string `json:"baseHostGatewayDomains,omitempty"`
+	// RuntimeAllow and RuntimeHostGatewayDomains are the entries `hole modify` added to the
+	// running gateway, in canonical form.
+	RuntimeAllow              []string `json:"runtimeAllow,omitempty"`
+	RuntimeHostGatewayDomains []string `json:"runtimeHostGatewayDomains,omitempty"`
+
 	RunTmpDir string    `json:"runTmpDir,omitempty"`
 	LogFile   string    `json:"logFile,omitempty"`
 	StartedAt time.Time `json:"startedAt"`
@@ -99,6 +111,12 @@ type Instance struct {
 	// Phase is PhaseStarting until the agent container is up, then PhaseRunning. Empty in state
 	// files written by older Hole versions; readers treat that as running.
 	Phase string `json:"phase,omitempty"`
+}
+
+// SourcedEntry is one allow entry with where it came from.
+type SourcedEntry struct {
+	Entry  string `json:"entry"`
+	Source string `json:"source"`
 }
 
 // Uptime is how long the sandbox has been running.

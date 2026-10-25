@@ -94,7 +94,7 @@ func testInput(t *testing.T, projectDir, runTmpDir string, settings *config.Sett
 		host:           testHost(),
 		startupAgent:   claude,
 		enabledAgents:  enabled,
-		policy:         network.BuildPolicy(nil, nil, false),
+		policy:         network.BuildPolicy(nil, nil, nil, false),
 		dockerEnabled:  settings.Container.Docker || opts.WithDocker,
 		dindVolume:     dindVolume,
 		interactive:    true,

@@ -179,13 +179,15 @@ hole settings open project .   # edit the project settings file, then validate i
 hole settings open global      # the same for the global settings file
 hole settings get project .    # print the path of the project settings file
 hole settings get global       # print the path of the global settings file
+hole modify . network.allow add example.com   # allow a domain in the running sandbox
+hole modify . network.allow    # edit the running sandbox's allow list interactively
 hole version                   # print the installed version
 hole update                    # upgrade to the latest release
 hole uninstall                 # remove Hole's Docker resources and the binary
 hole help                      # usage
 ```
 
-`hole list` shows the instance ID, agent (and profile), project path, uptime, whether Docker-in-Docker is enabled, the sandbox network, and which settings files were merged — the global one by path, e.g. `global(~/.hole/settings.json)+project`, so a sandbox started with [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file) shows which file it runs with. A [`HOLE_PROJECT_SETTINGS_FILE`](#alternative-project-settings-file) override is named by path too, e.g. `project(/path/to/project-settings.json)`; the in-repo file stays plain `project`.
+`hole list` shows the instance ID, agent (and profile), project path, uptime, whether Docker-in-Docker is enabled, the sandbox network, how many entries [`hole modify`](#changing-the-network-of-a-running-sandbox) added to the running sandbox (`RUNTIME`), and which settings files were merged — the global one by path, e.g. `global(~/.hole/settings.json)+project`, so a sandbox started with [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file) shows which file it runs with. A [`HOLE_PROJECT_SETTINGS_FILE`](#alternative-project-settings-file) override is named by path too, e.g. `project(/path/to/project-settings.json)`; the in-repo file stays plain `project`.
 
 `hole list` also cleans up what dead sandboxes left behind, which costs a handful of container runtime calls. `--no-gc` skips that cleanup. The output stays correct: a dead sandbox is never listed, it is only not cleaned up by that call. Cleanup still happens on every `hole start` and every plain `hole list`.
 
@@ -238,6 +240,7 @@ With an instance ID, `hole list` shows only that sandbox; when it is not running
 | `flags` | The flags the sandbox was started with |
 | `pid` | PID of the `hole start` process — the one to signal to stop the sandbox |
 | `version` | The Hole version that started the sandbox |
+| `runtimeEntryCount` | How many `network.allow` and `network.hostGatewayDomains` entries [`hole modify`](#changing-the-network-of-a-running-sandbox) added to the running sandbox; `0` when none |
 
 Fields are stable: new ones may be added, existing ones are never renamed or removed.
 
@@ -871,13 +874,52 @@ Other things to know:
 
 - **The port list is required.** The firewall matches the host gateway *address*, not the name, so a port-less entry would expose every service on your machine — SSH, a TCP-exposed Docker socket, databases, anything bound to `0.0.0.0`. Several entries for the same name merge into one, opening the union of their ports.
 - **A project-file entry needs the trust prompt.** `hostGatewayDomains` in `<project>/.hole/settings.json` only takes effect once you have accepted that project's settings; see [Project trust](#project-trust).
-- **A settings change needs a restart.** The gateway reads its configuration once at startup, so exit the sandbox and run `hole start` again — a running sandbox will not pick the new entry up.
+- **A settings change needs a restart.** The gateway reads its configuration once at startup, so exit the sandbox and run `hole start` again — a running sandbox will not pick the new entry up. To add an entry to a running sandbox without a restart, use [`hole modify`](#changing-the-network-of-a-running-sandbox).
 
 The ports are unioned across *all* entries: with `"host.internal:5432"` and `"mydb.local:8080"` the sandbox can reach the host gateway IP on both 5432 and 8080, directly and without DNS. The names choose what resolves, not what the firewall permits.
 
 If the runtime offers no usable host gateway address at all, the sandbox refuses to start and says so, rather than starting with the feature quietly broken.
 
 **Subdomains work the opposite way from `network.allow` above.** There is no `*.` syntax here — `"*.mydb.local:5432"` is rejected — but each entry claims the whole name *and everything under it*: with `"mydb.local:5432"` the names `db.mydb.local` and `a.b.mydb.local` resolve to the host gateway too. That is not extra reach (the firewall matches the address and the port union regardless of name), but it does mean **an entry whose name overlaps a real domain hijacks that entire domain for the sandbox**. `"example.com:8080"` makes `api.example.com` resolve to your host gateway even when `api.example.com` is in `network.allow`, so the real site becomes unreachable from the sandbox. Use names you control, ideally under a suffix that cannot resolve publicly (`.local`, `.internal`, `.test`).
+
+### Changing the network of a running sandbox
+
+A settings change needs a restart, which ends the agent's session. `hole modify` changes the allow list of a **running** sandbox instead, and the change lasts exactly as long as that sandbox: it is never written to a settings file, survives a restart of the gateway container, and a new `hole start` always begins with the allow list from your settings again.
+
+```sh
+hole modify . network.allow add example.com "*.npmjs.org" db.example.com:5432
+hole modify . network.allow remove example.com
+hole modify . network.allow list            # effective list, with where each entry came from
+hole modify . network.allow list-blocked    # names the sandbox asked for and was refused
+hole modify . network.allow                 # interactive editor (same as `edit`)
+hole modify . network.hostGatewayDomains add host.internal:3000
+```
+
+`hole modify {path} {setting} [{operation} [{value}...]] [--instance-id ID] [--json]`
+
+- **`{path}`** is the project directory exactly as the sandbox was started for (`.` works); a subdirectory does not select its parent's sandbox. With several sandboxes running for the project, a terminal asks which one, and anything else fails with their IDs — pass `--instance-id` to pick one directly.
+- **`{setting}`** is `network.allow` or `network.hostGatewayDomains`, with the same entry grammar as in the settings file. No other setting can change at runtime.
+- **Operations**: `add` and `remove` take one or more values and apply them in one step; `remove` only removes entries `hole modify` added — entries from your settings or an agent's built-in list stay. Adding an entry that is already allowed does nothing. `list` shows every effective entry with its source (`settings`, `agent:<name>` or `runtime`). `list-blocked` (`network.allow` only) shows the names the gateway refused, newest first, with how often and when — handy right after the agent reports a failed request. `edit` opens an editor with an *Allowed* and a *Blocked* tab: stage new entries (`n`), removals (`d`), or allow a refused name (`a`, `p` for other ports, `w` for `*.<parent>`), then apply them all with `s`. Without an operation, `hole modify` opens the editor on a terminal and is a usage error otherwise.
+- **`--json`** works with `list` and `list-blocked`:
+
+  ```json
+  {"instanceId": "r8tq2c", "entries": [{"entry": "github.com:80,443", "source": "settings"}]}
+  {"instanceId": "r8tq2c", "blocked": [{"name": "evil.example.org", "count": 3, "firstSeen": "2026-10-25T10:00:00Z", "lastSeen": "2026-10-25T10:01:00Z"}]}
+  ```
+
+  Data goes to stdout, messages to stderr; `add` and `remove` print nothing on success.
+
+Applying a change never restarts the gateway, so open connections — including the agent's own in-flight requests — and every address already resolved stay intact. The gateway switches over in an order that never lets a name resolve before its traffic is permitted, and a failed change is rolled back with the previous allow list still in force.
+
+Not possible at runtime:
+
+- **`docker.io` / `*.docker.io`** — they decide at start whether the [Docker Hub image cache](#docker-in-docker) is attached; add them to your settings and restart.
+- **`network.allow` with `-u`** — everything is already allowed. `hostGatewayDomains` can still change.
+- **A host gateway domain over an allowed name, or an allowed name under one** — the name would resolve to your host instead of the internet (see [Host gateway domains](#host-gateway-domains)).
+
+`list-blocked` comes from the gateway's DNS log, so like the [`-n` dump](#network-access) it does not show direct-IP connection attempts.
+
+Exit codes: `0` success, `1` usage error, `2` invalid value (malformed entry, `docker.io`, removing a non-runtime entry, a setting that cannot change, `network.allow` with `-u`, a host gateway conflict), `3` no running sandbox for the path (also: still starting, stopping, ambiguous without a terminal, or started by a Hole without `hole modify` — restart it), `4` the gateway could not apply the change and the previous allow list is still in force, `130` interrupted.
 
 ### Subnet pool
 

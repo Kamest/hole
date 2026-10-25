@@ -18,7 +18,8 @@
       "storage.googleapis.com",
       "github.com",
       "raw.githubusercontent.com",
-      "objects.githubusercontent.com"
+      "objects.githubusercontent.com",
+      "ports.ubuntu.com"
     ]
   },
   "git": {

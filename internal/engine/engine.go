@@ -138,6 +138,31 @@ func (e *Engine) Exec(container string, args ...string) (string, error) {
 	return e.output(append([]string{"exec", container}, args...)...)
 }
 
+// ExecInput runs a command inside a running container with stdin fed from a reader and returns
+// its output and exit code. A command that ran and exited non-zero is not an error: its exit
+// code is the result, so the caller can tell its failure modes apart. err reports only that the
+// command could not be run at all.
+func (e *Engine) ExecInput(container string, stdin io.Reader, args ...string) (stdout, stderr string, exitCode int, err error) {
+	start := time.Now()
+	var outBuf, errBuf bytes.Buffer
+	cmd := exec.Command(e.Binary, append([]string{"exec", "-i", container}, args...)...)
+	cmd.Stdin = stdin
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	runErr := cmd.Run()
+	logging.Debug("engine: %s exec -i %s %s (%s)", e.Binary, container, strings.Join(args, " "),
+		time.Since(start).Round(time.Millisecond))
+	var exitErr *exec.ExitError
+	switch {
+	case runErr == nil:
+		return outBuf.String(), errBuf.String(), 0, nil
+	case errors.As(runErr, &exitErr):
+		return outBuf.String(), errBuf.String(), exitErr.ExitCode(), nil
+	default:
+		return outBuf.String(), errBuf.String(), -1, fmt.Errorf("%s exec %s: %w", e.Binary, container, runErr)
+	}
+}
+
 // ComposeUp starts services from a generated compose file, writing compose's output (image
 // builds included) to out, or to the console when out is nil.
 //
@@ -805,9 +830,13 @@ func (e *Engine) ContainerLogs(name string) (string, error) {
 // matters for the agent container: an interactive agent's terminal redraws can make it huge,
 // while the caller only needs its beginning.
 func (e *Engine) ContainerLogLines(name string, consume func(line string) bool) error {
+	return e.streamLogs(name, []string{"logs", name}, consume)
+}
+
+func (e *Engine) streamLogs(name string, args []string, consume func(line string) bool) error {
 	start := time.Now()
 	reader, writer := io.Pipe()
-	cmd := exec.Command(e.Binary, "logs", name)
+	cmd := exec.Command(e.Binary, args...)
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 	if err := cmd.Start(); err != nil {
@@ -847,6 +876,33 @@ func (e *Engine) ContainerLogLines(name string, consume func(line string) bool) 
 		return fmt.Errorf("%s logs %s: %w", e.Binary, name, err)
 	}
 	return nil
+}
+
+// ContainerLogsTimestamped streams a container's combined log with the runtime's timestamps
+// (`logs -t`), until consume returns false or the log ends. Lines without a parseable RFC 3339
+// timestamp prefix are skipped.
+func (e *Engine) ContainerLogsTimestamped(name string, consume func(ts time.Time, line string) bool) error {
+	return e.streamLogs(name, []string{"logs", "-t", name}, func(line string) bool {
+		stamp, rest, found := strings.Cut(line, " ")
+		if !found {
+			return true
+		}
+		ts, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil {
+			return true
+		}
+		return consume(ts, rest)
+	})
+}
+
+// ContainerHealth reports a container's healthcheck status (`starting`, `healthy`, `unhealthy`),
+// or "" when it has none or cannot be inspected.
+func (e *Engine) ContainerHealth(name string) string {
+	raw, err := e.output("container", "inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{end}}", name)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(raw)
 }
 
 // scanTerminalLines splits like bufio.ScanLines, except that a line redrawn with `\r` (a progress
