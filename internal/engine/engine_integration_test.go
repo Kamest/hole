@@ -392,8 +392,11 @@ func TestAttachWithoutATerminal(t *testing.T) {
 			_ = engine.ContainerRemove(container)
 			t.Cleanup(func() { _ = engine.ContainerRemove(container) })
 
+			// The container must still be running when `attach` reaches the daemon. Against a
+			// remote daemon (DOCKER_HOST=tcp://…) each CLI call alone takes about a second, so
+			// a one-second lifetime ended before the attach and the runtime refused it.
 			args := append([]string{"run", "-d"}, test.runFlags...)
-			args = append(args, "--name", container, "alpine:3.19", "sh", "-c", "sleep 1; exit 7")
+			args = append(args, "--name", container, "alpine:3.19", "sh", "-c", "sleep 5; exit 7")
 			if err := engine.RunQuiet(args...); err != nil {
 				t.Skipf("could not start a container: %v", err)
 			}
