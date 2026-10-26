@@ -40,6 +40,17 @@ assets/agents/<name>/      (builtin, embedded)
   users add those through `network.allow`.
 - `install-user.sh` typically also pre-seeds config so the user is not re-prompted in every
   sandbox — claude writes `~/.claude.json` with the onboarding and trust flags accepted.
+  `~/.claude.json` is baked into the image (only `~/.claude/` is mounted), so an answer given in
+  one sandbox is lost in the next.
+- Claude's workspace trust dialog is suppressed by `CLAUDE_CODE_SANDBOXED=1`, not by the baked
+  `projects["/"]` trust entry: Claude Code stopped honouring trust entries above a project's git
+  root (and above `$HOME` outside git), so that entry only still helps older CLIs and non-git
+  directories outside `$HOME`. The variable is set twice, because the compose `command` is exec'd
+  without a shell: `command.json` prefixes `env CLAUDE_CODE_SANDBOXED=1`, and `install-user.sh`
+  exports it from `~/.bash_env` for `claude` started in a `-d` shell or a hook. It is not in Claude
+  Code's public documentation; if a release renames it, the dialog returns but nothing is
+  weakened. `.bash_env` is image-wide, so shells in gemini and codex sandboxes export it too —
+  harmless, as only Claude reads it. `TestClaudeRunsAsSandboxed` guards both places.
 - Every install and update script cleans its package manager's cache in the same script — npm's
   alone was ~300 MB of the image, and a cache written in one layer is never reclaimed by a later
   one.

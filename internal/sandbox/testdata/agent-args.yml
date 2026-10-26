@@ -12,6 +12,8 @@ services:
                 UID: "1000"
         pull_policy: never
         command:
+            - env
+            - CLAUDE_CODE_SANDBOXED=1
             - claude
             - --dangerously-skip-permissions
             - -p
