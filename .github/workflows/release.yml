@@ -62,7 +62,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
 
       # GORELEASER_CURRENT_TAG makes the resolved version explicit instead of relying on

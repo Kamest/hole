@@ -66,8 +66,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # container's — it lives in the gateway image only because that image always exists by the
 # time it is needed. Both iptables backends are asserted above: the helper must speak
 # whichever one the host daemon uses.
+#
+# hole-gateway-apply is what `hole modify` runs (docker exec) to change the policy of a running
+# gateway; hole-gateway-lib.sh is shared by it and the entrypoint.
 COPY entrypoint.sh /entrypoint.sh
 COPY hole-bridge-netfilter /usr/local/bin/hole-bridge-netfilter
-RUN chmod +x /entrypoint.sh /usr/local/bin/hole-bridge-netfilter
+COPY hole-gateway-apply /usr/local/bin/hole-gateway-apply
+COPY hole-gateway-lib.sh /usr/local/bin/hole-gateway-lib.sh
+RUN chmod +x /entrypoint.sh /usr/local/bin/hole-bridge-netfilter /usr/local/bin/hole-gateway-apply
 
 ENTRYPOINT ["/entrypoint.sh"]

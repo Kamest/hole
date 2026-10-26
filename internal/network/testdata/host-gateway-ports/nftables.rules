@@ -4,7 +4,7 @@ table inet hole
 delete table inet hole
 
 table inet hole {
-    set g0 {
+    set b_3e9eb28d23 {
         type ipv4_addr
     }
 
@@ -14,8 +14,8 @@ table inet hole {
         ct state established,related accept
         ip daddr {HOST_GATEWAY_IP} tcp dport { 5432, 8080 } accept
         ip daddr {HOST_GATEWAY_IP} udp dport { 5432, 8080 } accept
-        ip daddr @g0 tcp dport { 80, 443 } accept
-        ip daddr @g0 udp dport { 80, 443 } accept
+        ip daddr @b_3e9eb28d23 tcp dport { 80, 443 } accept
+        ip daddr @b_3e9eb28d23 udp dport { 80, 443 } accept
         counter limit rate 10/minute log prefix "hole-denied " level info
     }
 

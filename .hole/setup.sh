@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # Define the Go version and architecture
-GO_VERSION="1.25.12"
+GO_VERSION="1.27.3"
 ARCH="arm64" # Change to arm64 if you are on an ARM-based machine (like Apple Silicon)
 
 # Define userspace paths
@@ -44,7 +44,7 @@ fi
 
 # golangci-lint — the same version CI pins (.github/workflows/ci.yml, golangci-lint-action
 # `version:`); keep the two in sync, or `make lint` here and the CI gate disagree.
-GOLANGCI_LINT_VERSION="v2.5.0"
+GOLANGCI_LINT_VERSION="v2.14.0"
 echo "➡️ Installing golangci-lint ${GOLANGCI_LINT_VERSION}..."
 curl -fsSL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
   | sh -s -- -b "$HOME/go/bin" "${GOLANGCI_LINT_VERSION}"

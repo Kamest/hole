@@ -1,0 +1,23 @@
+#!/usr/sbin/nft -f
+# In-place update of a running gateway; the input and postrouting chains never change at runtime.
+flush chain inet hole forward
+
+table inet hole {
+    set b_89e78c4064_static {
+        type ipv4_addr
+        flags interval
+        # auto-merge collapses an address already covered by a CIDR in the same set; without it
+        # nft rejects the whole ruleset with "conflicting intervals" and the gateway never starts.
+        auto-merge
+        elements = { 10.0.0.0/24, 10.0.0.5 }
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        meta nfproto ipv6 drop
+        ct state established,related accept
+        ip daddr @b_89e78c4064_static tcp dport { 443 } accept
+        ip daddr @b_89e78c4064_static udp dport { 443 } accept
+        counter limit rate 10/minute log prefix "hole-denied " level info
+    }
+}

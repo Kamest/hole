@@ -1,0 +1,158 @@
+#!/bin/bash
+# Applies a runtime change of the egress policy (`hole modify`) to this running gateway, without
+# restarting the container: a new container would lose conntrack/NAT state — every open
+# connection — and every address dnsmasq recorded.
+#
+# stdin is a tar stream from the CLI, rendered by the same generator `hole start` uses:
+#   Corefile, dnsmasq.conf, nftables.rules  the new configuration (start-mode ruleset, persisted only)
+#   open.nft                                in-place ruleset for base + previous + new runtime entries
+#   final.nft                               in-place ruleset for base + new runtime entries
+#   previous/{Corefile,dnsmasq.conf,apply.nft}  the configuration in force, for rollback
+#
+# Order is fail-closed: open.nft first, then dnsmasq, then CoreDNS, then final.nft. A name never
+# resolves before its addresses can be recorded and permitted, and a removed name stops resolving
+# before its rules go. Every apply is declarative, so any apply also repairs an earlier partial one.
+#
+# Exit codes: 10 no usable host gateway address, 11 invalid payload (nothing changed),
+# 12 apply failed and was rolled back, 13 apply and rollback failed.
+set -euo pipefail
+
+# shellcheck source=hole-gateway-lib.sh
+source /usr/local/bin/hole-gateway-lib.sh
+
+# Serializes with a concurrent apply.
+exec 9>/run/hole-apply.lock
+flock 9
+
+mkdir -p "${HOLE_RUN_DIR}"
+staging="$(mktemp -d "${HOLE_RUN_DIR}/next.XXXXXX")"
+trap 'rm -rf "${staging}"' EXIT
+
+invalid() {
+  echo "ERROR: $*" >&2
+  exit 11
+}
+
+tar -x -C "${staging}" -f - || invalid "could not read the configuration payload"
+for file in Corefile dnsmasq.conf nftables.rules open.nft final.nft \
+  previous/Corefile previous/dnsmasq.conf previous/apply.nft; do
+  [[ -f "${staging}/${file}" ]] || invalid "the configuration payload has no ${file}"
+done
+
+host_gateway_ip="$(host_gateway_address)"
+if needs_host_gateway "${staging}/Corefile" && ! usable_host_gateway "${host_gateway_ip}"; then
+  echo "ERROR: no usable IPv4 host gateway address in /etc/hosts (found '${host_gateway_ip:-none}');" >&2
+  echo "       network.hostGatewayDomains cannot work on this container runtime" >&2
+  exit 10
+fi
+# Never leave the placeholder in the rules (see entrypoint.sh).
+[[ -n "${host_gateway_ip}" ]] || host_gateway_ip="127.0.0.1"
+
+for file in Corefile open.nft final.nft previous/Corefile previous/apply.nft; do
+  substitute_host_gateway "${staging}/${file}" "${staging}/${file}.resolved" "${host_gateway_ip}"
+done
+
+dnsmasq --test --conf-file="${staging}/dnsmasq.conf" >/dev/null 2>&1 \
+  || invalid "dnsmasq rejects the new configuration: $(dnsmasq --test --conf-file="${staging}/dnsmasq.conf" 2>&1)"
+nft -c -f "${staging}/open.nft.resolved" || invalid "nft rejects the transitional ruleset"
+nft -c -f "${staging}/final.nft.resolved" || invalid "nft rejects the new ruleset"
+
+# The generation the health zone answers as TXT once CoreDNS serves this Corefile.
+corefile_generation() {
+  sed -n 's/.*IN TXT \\"\([0-9a-f]*\)\\".*/\1/p' "$1" | head -1
+}
+
+restart_dnsmasq() {
+  local old_pid
+  old_pid="$(cat "${HOLE_DNSMASQ_PID}" 2>/dev/null || true)"
+  if [[ -n "${old_pid}" ]]; then
+    kill "${old_pid}" 2>/dev/null || true
+  fi
+  local deadline=$((SECONDS + 5))
+  while [[ -n "${old_pid}" ]] && kill -0 "${old_pid}" 2>/dev/null; do
+    ((SECONDS < deadline)) || { echo "ERROR: dnsmasq (pid ${old_pid}) did not stop" >&2; return 1; }
+    sleep 0.1
+  done
+  # Captured rather than piped into grep -q, which could SIGPIPE dig under pipefail.
+  while [[ -z "$(dig +short +time=1 +tries=1 -p 5353 @127.0.0.1 version.bind CH TXT 2>/dev/null || true)" ]]; do
+    ((SECONDS < deadline)) || { echo "ERROR: dnsmasq did not come back with the new configuration" >&2; return 1; }
+    sleep 0.1
+  done
+}
+
+reload_coredns() {
+  local generation="$1"
+  kill -USR1 1
+  local deadline=$((SECONDS + 5))
+  until [[ "$(dig +short +time=1 +tries=1 TXT "health.hole.internal" @127.0.0.1 2>/dev/null)" == "\"${generation}\"" ]]; do
+    ((SECONDS < deadline)) || { echo "ERROR: CoreDNS did not load the new Corefile (generation ${generation})" >&2; return 1; }
+    sleep 0.1
+  done
+}
+
+declared_sets() {
+  sed -n 's/^[[:space:]]*set \([br]_[0-9a-f]*\(_static\)\{0,1\}\) {.*/\1/p' "$1"
+}
+
+# Deletes the b_*/r_* sets the ruleset in force no longer declares. A set that cannot be deleted
+# is reported but not fatal: no rule references it any more.
+delete_unused_sets() {
+  local declared set
+  declared="$(declared_sets "$1")"
+  for set in $(nft list table inet hole | declared_sets /dev/stdin); do
+    if ! grep -qx "${set}" <<<"${declared}"; then
+      nft delete set inet hole "${set}" || echo "WARNING: could not delete unused set ${set}" >&2
+    fi
+  done
+}
+
+# apply_config <Corefile> <dnsmasq.conf> <open.nft> <final.nft>
+apply_config() {
+  local corefile="$1" dnsmasq_conf="$2" open_rules="$3" final_rules="$4"
+  nft -f "${open_rules}" || { echo "ERROR: applying the transitional ruleset failed" >&2; return 1; }
+  if ! cmp -s "${dnsmasq_conf}" "${HOLE_RUN_DIR}/dnsmasq.conf"; then
+    # errexit is off here (apply_config runs as an if condition), so every step checks itself.
+    cp "${dnsmasq_conf}" "${HOLE_RUN_DIR}/dnsmasq.conf.tmp" || return 1
+    mv -f "${HOLE_RUN_DIR}/dnsmasq.conf.tmp" "${HOLE_RUN_DIR}/dnsmasq.conf" || return 1
+    restart_dnsmasq || return 1
+  fi
+  if ! cmp -s "${corefile}" "${HOLE_RUN_DIR}/Corefile"; then
+    cp "${corefile}" "${HOLE_RUN_DIR}/Corefile.tmp" || return 1
+    mv -f "${HOLE_RUN_DIR}/Corefile.tmp" "${HOLE_RUN_DIR}/Corefile" || return 1
+    reload_coredns "$(corefile_generation "${corefile}")" || return 1
+  fi
+  nft -f "${final_rules}" || { echo "ERROR: applying the new ruleset failed" >&2; return 1; }
+  delete_unused_sets "${final_rules}"
+}
+
+if ! apply_config "${staging}/Corefile.resolved" "${staging}/dnsmasq.conf" \
+  "${staging}/open.nft.resolved" "${staging}/final.nft.resolved"; then
+  echo "Rolling back to the previous configuration" >&2
+  if apply_config "${staging}/previous/Corefile.resolved" "${staging}/previous/dnsmasq.conf" \
+    "${staging}/previous/apply.nft.resolved" "${staging}/previous/apply.nft.resolved"; then
+    exit 12
+  fi
+  echo "ERROR: the rollback failed too; the gateway may still permit the union of the old and new entries" >&2
+  exit 13
+fi
+
+# Persisted only after a successful apply, unsubstituted like /etc/hole, so a restart of this
+# container re-renders them exactly as the entrypoint renders the mounted files. Best-effort: the
+# new policy is already in force, and a lost copy only means a restart of this container falls
+# back to the start configuration — which is the base list, i.e. fail-closed.
+persist() {
+  local target old
+  mkdir -p "${HOLE_STATE_DIR}" || return 1
+  target="$(mktemp -d "${HOLE_STATE_DIR}/runtime.XXXXXX")" || return 1
+  cp "${staging}/Corefile" "${staging}/dnsmasq.conf" "${staging}/nftables.rules" "${target}/" || return 1
+  chmod 755 "${target}" || return 1
+  ln -sfn "$(basename "${target}")" "${HOLE_STATE_DIR}/runtime.tmp" || return 1
+  mv -T "${HOLE_STATE_DIR}/runtime.tmp" "${HOLE_RUNTIME_DIR}" || return 1
+  for old in "${HOLE_STATE_DIR}"/runtime.*; do
+    [[ "${old}" == "${target}" || "${old}" == "${HOLE_STATE_DIR}/runtime.tmp" ]] || rm -rf "${old}"
+  done
+}
+if ! persist; then
+  echo "WARNING: the change is in force but could not be stored; a restart of the gateway container" >&2
+  echo "         would fall back to the sandbox's start configuration" >&2
+fi

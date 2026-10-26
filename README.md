@@ -84,6 +84,7 @@ Run without a terminal — from a script, a CI job, or with the output piped —
 | `--with-docker` | Enable the Docker-in-Docker sidecar |
 | `--trust-project` | Accept whatever the project's own settings ask for beyond the sandbox — host access and network widening alike — without being asked, and remember it; see [project trust](#project-trust) |
 | `--library PATH[:MOUNT][:rw]` | Mount an extra directory (repeatable); mounted at its own host path unless `MOUNT` is given, read-only unless `:rw` |
+| `--instance-id ID` | Use this instance ID instead of a random one: exactly 6 characters `a-z`, `0-9`. It must not belong to another running sandbox, in any project; a start that is rejected for that reason (or for a bad format) exits non-zero and creates nothing. Meant for tools that start Hole and then query it with [`hole list --json ID`](#machine-readable-list) |
 | `--` | Everything after this is passed verbatim to the agent CLI |
 
 `-r` is only needed to refresh *versions* (latest apt packages, latest agent CLIs). Changing a
@@ -166,16 +167,98 @@ Arguments after `--` reach the agent exactly as you typed them. `-d` cannot be c
 
 ```sh
 hole list                      # show running sandboxes
+hole list r8tq2c               # show one sandbox by instance ID
+hole list --json [ID]          # the same as JSON, for tools
+hole list --json --no-gc ID    # JSON without cleaning up leftovers, for tools that poll
 hole destroy                   # destroy ALL Hole Docker resources
 hole destroy .                 # destroy resources for the current project
 hole destroy /path/to/project  # destroy resources for a specific project
+hole settings create project . # write .hole/settings.json with the $schema reference
+hole settings create global    # the same for ~/.hole/settings.json
+hole settings open project .   # edit the project settings file, then validate it
+hole settings open global      # the same for the global settings file
+hole settings get project .    # print the path of the project settings file
+hole settings get global       # print the path of the global settings file
+hole modify . network.allow add example.com   # allow a domain in the running sandbox
+hole modify . network.allow    # edit the running sandbox's allow list interactively
 hole version                   # print the installed version
 hole update                    # upgrade to the latest release
 hole uninstall                 # remove Hole's Docker resources and the binary
 hole help                      # usage
 ```
 
-`hole list` shows the instance ID, agent (and profile), project path, uptime, whether Docker-in-Docker is enabled, the sandbox network, and which settings files were merged — the global one by path, e.g. `global(~/.hole/settings.json)+project`, so a sandbox started with [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file) shows which file it runs with. A [`HOLE_PROJECT_SETTINGS_FILE`](#alternative-project-settings-file) override is named by path too, e.g. `project(/path/to/project-settings.json)`; the in-repo file stays plain `project`.
+`hole list` shows the instance ID, agent (and profile), project path, uptime, whether Docker-in-Docker is enabled, the sandbox network, how many entries [`hole modify`](#changing-the-network-of-a-running-sandbox) added to the running sandbox (`RUNTIME`), and which settings files were merged — the global one by path, e.g. `global(~/.hole/settings.json)+project`, so a sandbox started with [`HOLE_SETTINGS_FILE`](#alternative-global-settings-file) shows which file it runs with. A [`HOLE_PROJECT_SETTINGS_FILE`](#alternative-project-settings-file) override is named by path too, e.g. `project(/path/to/project-settings.json)`; the in-repo file stays plain `project`.
+
+`hole list` also cleans up what dead sandboxes left behind, which costs a handful of container runtime calls. `--no-gc` skips that cleanup. The output stays correct: a dead sandbox is never listed, it is only not cleaned up by that call. Cleanup still happens on every `hole start` and every plain `hole list`.
+
+With an instance ID, `hole list` shows only that sandbox; when it is not running, the table mode says so and JSON mode prints `[]`. A malformed ID is an error.
+
+#### Machine-readable list
+
+`hole list --json` prints a JSON array to stdout, one object per running sandbox, and nothing else: log lines (including cleanup messages) go to stderr. With nothing running, or an ID that is not running, it prints `[]` and exits `0`. An error — no container runtime, an unreadable registry — prints a message on stderr, nothing on stdout, and exits non-zero.
+
+```json
+[
+  {
+    "instanceId": "r8tq2c",
+    "instanceName": "hole-sandbox-edeecms-1a2b3c4d-r8tq2c",
+    "status": "running",
+    "agent": "claude",
+    "profile": "research",
+    "projectPath": "/Users/me/projects/edeecms",
+    "projectName": "edeecms-1a2b3c4d",
+    "startedAt": "2026-10-21T10:14:03+02:00",
+    "uptimeSeconds": 754,
+    "docker": false,
+    "networks": ["hole-sandbox-edeecms-1a2b3c4d-r8tq2c_sandbox", "hole-sandbox-edeecms-1a2b3c4d-r8tq2c_internet"],
+    "settings": ["global(~/.hole/settings.json)", "project"],
+    "settingsFiles": ["/Users/me/.hole/settings.json", "/Users/me/projects/edeecms/.hole/settings.json"],
+    "flags": {
+      "debug": false,
+      "rebuild": false,
+      "unrestricted": false,
+      "dumpNetworkAccess": false,
+      "withDocker": false
+    },
+    "pid": 48211,
+    "version": "2.3.0"
+  }
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `instanceId`, `instanceName` | The 6-character ID, and the name Docker resources are prefixed with |
+| `status` | `starting`, `running` or `stopping`, see below |
+| `agent`, `profile` | The agent, and the profile (`""` when none — never omitted) |
+| `projectPath`, `projectName` | The project directory, and the name Hole derives from it |
+| `startedAt`, `uptimeSeconds` | Start time (RFC 3339 with offset), and seconds since then |
+| `docker` | Docker-in-Docker is enabled. It is set once the sidecar's volume exists, so it can read `false` while `starting` and turn `true` later |
+| `networks` | The sandbox's networks, `[]` when none exist yet — never `null` |
+| `settings` | The labels of the merged settings files, as in the table's SETTINGS column; `["defaults"]` when no file contributed |
+| `settingsFiles` | Absolute paths of the merged settings files, `[]` when none |
+| `flags` | The flags the sandbox was started with |
+| `pid` | PID of the `hole start` process — the one to signal to stop the sandbox |
+| `version` | The Hole version that started the sandbox |
+| `runtimeEntryCount` | How many `network.allow` and `network.hostGatewayDomains` entries [`hole modify`](#changing-the-network-of-a-running-sandbox) added to the running sandbox; `0` when none |
+
+Fields are stable: new ones may be added, existing ones are never renamed or removed.
+
+`status` is `starting` from the moment the sandbox is registered until the agent container is up, then `running`. It becomes `stopping` when `hole start` receives SIGINT, SIGTERM or SIGHUP, or when teardown begins for any other reason (the agent exited, the watchdog or a cleanup took over); a sandbox that is torn down drops out of the list. A sandbox started by a Hole version without this field reports `running`. `status` is defined only by `hole list --json`: the files under `~/.hole/instances/` are not a contract and never contain `stopping`.
+
+Tools that poll should use `--no-gc`, so a poll every second does not keep the container runtime busy with cleanup.
+
+#### Stopping a sandbox from another program
+
+A program that runs `hole start` (an IDE plugin, for example) and wants to stop the sandbox must send SIGINT to `hole start`'s **process group**, the way a terminal's Ctrl-C does. Signalling only the `hole` process also tears the sandbox down, but if it arrives during an image build or a container start, the teardown waits until that step finishes, which can take minutes; the group signal stops the running step too.
+
+- Launch `hole start …` directly as the process of the pty, so that it leads its own process group. If a shell wrapper is unavoidable, it must `exec hole …`, so the PID stays the group leader.
+- Stop with `kill -INT -<pid>` (note the minus: the group), or the equivalent call of your platform. Check that a negative PID really reaches `kill(2)`.
+- Do not kill the process *tree*: that also signals Hole's teardown watchdog, which runs in its own session on purpose.
+- Do not write Ctrl-C (`0x03`) to the pty: once the terminal is attached to the agent it is in raw mode, and the byte reaches the agent as a keystroke instead of a signal.
+- After signalling, poll `hole list --json --no-gc <id>` (it reports `stopping`) until it prints `[]` and the process has exited.
+
+Closing the pty sends SIGHUP to the foreground process group, which Hole handles with the same teardown.
 
 ## Installation
 
@@ -199,11 +282,13 @@ support. That is all — Hole embeds everything else it needs. An older engine s
 [excluded directories](#file-exclusions) are then held in memory instead of on disk, and Hole warns
 about it on every start.
 
-Supported platforms: Linux (amd64/arm64, including WSL) and macOS (Intel/Apple Silicon).
+Supported platforms: Linux (amd64/arm64, including WSL) and macOS 13 Ventura or later (Intel/Apple
+Silicon). On macOS 12 stay on the last release built before Go 1.27 — `hole update` does not check
+the OS version and would install a binary that does not start.
 
 ### Install with `go install`
 
-With a Go 1.25+ toolchain you can build Hole from source instead of downloading a release:
+With a Go 1.27+ toolchain you can build Hole from source instead of downloading a release:
 
 ```sh
 CGO_ENABLED=0 go install github.com/lukashornych/hole/v2/cmd/hole@latest
@@ -469,6 +554,14 @@ Add the schema reference for editor completion:
 }
 ```
 
+`hole settings create project .` (or `hole settings create global`) writes this snippet for you, creating `.hole/` if needed. It refuses to touch an existing file unless you pass `--overwrite`, which replaces the file with the snippet, or `--append`, which sets the snippet's top-level fields in your file, replacing any it already has, and keeps your key order but normalises the indentation to two spaces.
+
+`hole settings open project .` (or `open global`) starts `$VISUAL` / `$EDITOR` (or `vi` when neither is set and you are at a terminal) on an existing file; when the file is missing it fails and names the `hole settings create …` command to run. After the editor closes, the file is validated and any problem is reported exactly as `hole start` would report it; at a terminal you are offered to reopen the editor (`[Y/n]`), otherwise the command exits non-zero and the file stays as you saved it.
+
+`hole settings get project .` (or `get global`) prints the absolute path of the settings file `hole start` would read, and nothing else, so wrappers can use `"$(hole settings get project .)"`. It exits non-zero when the file does not exist.
+
+All three act on the file `hole start` reads, including the file named by `HOLE_SETTINGS_FILE` / `HOLE_PROJECT_SETTINGS_FILE`. Only `create` writes a missing file.
+
 All path-valued settings support `$VAR`/`${VAR}` expansion, `~/` (your home on the host side, the sandbox home on the container side), and paths relative to the project directory.
 
 ### Alternative global settings file
@@ -482,6 +575,7 @@ HOLE_SETTINGS_FILE=/path/to/generated-settings.json hole start claude .
 - The file **replaces** `~/.hole/settings.json` for that run — the two are not merged. The project's `.hole/settings.json` is merged on top as usual.
 - Only the settings document moves. `~` keeps meaning your real home, so `~/…` paths in project settings still resolve where they always did, and custom agents, [project trust](#project-trust), logs and the running-sandbox registry stay in `~/.hole`.
 - It must be an absolute path to an existing file; anything else stops the start instead of silently falling back to the default settings.
+- `hole settings create|open|get global` act on this file when the variable is set; `create` is the one command for which it need not exist yet.
 - It must not lie inside the project or inside any included, library or worktree path: the global file is trusted without a prompt, so an agent that could edit it could add a `hooks.setupHost` that runs on your host at the next start. Hole refuses to start in that case (symlinks are followed).
 - Relative paths inside it (hook scripts, for example) resolve against the **project**, like in any settings file — a wrapper shipping scripts beside the file should reference them by absolute path.
 
@@ -498,6 +592,7 @@ HOLE_PROJECT_SETTINGS_FILE=/path/to/project-settings.json hole start claude .
 - Only the main project is affected. Libraries, derived worktrees and worktree-pool checkouts keep reading their own `.hole/settings.json`.
 - It is still subject to [project trust](#project-trust), exactly like the in-repo file: a wrapper that must not prompt passes `--trust-project`, and an override asking for a different set of grants asks again.
 - It must be an absolute path to an existing file; anything else stops the start instead of silently falling back to the in-repo file.
+- `hole settings create|open|get project <path>` act on this file when the variable is set; `create` is the one command for which it need not exist yet.
 - Relative paths inside it resolve against the **project**, like in any settings file.
 - A wrapper that passes `--trust-project` on every run must not keep the file inside a path mounted into any sandbox: an agent could plant grants there that the next start accepts without asking, and unlike the in-repo file the override is not under the repository's review.
 
@@ -779,13 +874,52 @@ Other things to know:
 
 - **The port list is required.** The firewall matches the host gateway *address*, not the name, so a port-less entry would expose every service on your machine — SSH, a TCP-exposed Docker socket, databases, anything bound to `0.0.0.0`. Several entries for the same name merge into one, opening the union of their ports.
 - **A project-file entry needs the trust prompt.** `hostGatewayDomains` in `<project>/.hole/settings.json` only takes effect once you have accepted that project's settings; see [Project trust](#project-trust).
-- **A settings change needs a restart.** The gateway reads its configuration once at startup, so exit the sandbox and run `hole start` again — a running sandbox will not pick the new entry up.
+- **A settings change needs a restart.** The gateway reads its configuration once at startup, so exit the sandbox and run `hole start` again — a running sandbox will not pick the new entry up. To add an entry to a running sandbox without a restart, use [`hole modify`](#changing-the-network-of-a-running-sandbox).
 
 The ports are unioned across *all* entries: with `"host.internal:5432"` and `"mydb.local:8080"` the sandbox can reach the host gateway IP on both 5432 and 8080, directly and without DNS. The names choose what resolves, not what the firewall permits.
 
 If the runtime offers no usable host gateway address at all, the sandbox refuses to start and says so, rather than starting with the feature quietly broken.
 
 **Subdomains work the opposite way from `network.allow` above.** There is no `*.` syntax here — `"*.mydb.local:5432"` is rejected — but each entry claims the whole name *and everything under it*: with `"mydb.local:5432"` the names `db.mydb.local` and `a.b.mydb.local` resolve to the host gateway too. That is not extra reach (the firewall matches the address and the port union regardless of name), but it does mean **an entry whose name overlaps a real domain hijacks that entire domain for the sandbox**. `"example.com:8080"` makes `api.example.com` resolve to your host gateway even when `api.example.com` is in `network.allow`, so the real site becomes unreachable from the sandbox. Use names you control, ideally under a suffix that cannot resolve publicly (`.local`, `.internal`, `.test`).
+
+### Changing the network of a running sandbox
+
+A settings change needs a restart, which ends the agent's session. `hole modify` changes the allow list of a **running** sandbox instead, and the change lasts exactly as long as that sandbox: it is never written to a settings file, survives a restart of the gateway container, and a new `hole start` always begins with the allow list from your settings again.
+
+```sh
+hole modify . network.allow add example.com "*.npmjs.org" db.example.com:5432
+hole modify . network.allow remove example.com
+hole modify . network.allow list            # effective list, with where each entry came from
+hole modify . network.allow list-blocked    # names the sandbox asked for and was refused
+hole modify . network.allow                 # interactive editor (same as `edit`)
+hole modify . network.hostGatewayDomains add host.internal:3000
+```
+
+`hole modify {path} {setting} [{operation} [{value}...]] [--instance-id ID] [--json]`
+
+- **`{path}`** is the project directory exactly as the sandbox was started for (`.` works); a subdirectory does not select its parent's sandbox. With several sandboxes running for the project, a terminal asks which one, and anything else fails with their IDs — pass `--instance-id` to pick one directly.
+- **`{setting}`** is `network.allow` or `network.hostGatewayDomains`, with the same entry grammar as in the settings file. No other setting can change at runtime.
+- **Operations**: `add` and `remove` take one or more values and apply them in one step; `remove` only removes entries `hole modify` added — entries from your settings or an agent's built-in list stay. Adding an entry that is already allowed does nothing. `list` shows every effective entry with its source (`settings`, `agent:<name>` or `runtime`). `list-blocked` (`network.allow` only) shows the names the gateway refused, newest first, with how often and when — handy right after the agent reports a failed request. `edit` opens an editor with an *Allowed* and a *Blocked* tab: stage new entries (`n`), removals (`d`), or allow a refused name (`a`, `p` for other ports, `w` for `*.<parent>`), then apply them all with `s`. Without an operation, `hole modify` opens the editor on a terminal and is a usage error otherwise.
+- **`--json`** works with `list` and `list-blocked`:
+
+  ```json
+  {"instanceId": "r8tq2c", "entries": [{"entry": "github.com:80,443", "source": "settings"}]}
+  {"instanceId": "r8tq2c", "blocked": [{"name": "evil.example.org", "count": 3, "firstSeen": "2026-10-25T10:00:00Z", "lastSeen": "2026-10-25T10:01:00Z"}]}
+  ```
+
+  Data goes to stdout, messages to stderr; `add` and `remove` print nothing on success.
+
+Applying a change never restarts the gateway, so open connections — including the agent's own in-flight requests — and every address already resolved stay intact. The gateway switches over in an order that never lets a name resolve before its traffic is permitted, and a failed change is rolled back with the previous allow list still in force.
+
+Not possible at runtime:
+
+- **`docker.io` / `*.docker.io`** — they decide at start whether the [Docker Hub image cache](#docker-in-docker) is attached; add them to your settings and restart.
+- **`network.allow` with `-u`** — everything is already allowed. `hostGatewayDomains` can still change.
+- **A host gateway domain over an allowed name, or an allowed name under one** — the name would resolve to your host instead of the internet (see [Host gateway domains](#host-gateway-domains)).
+
+`list-blocked` comes from the gateway's DNS log, so like the [`-n` dump](#network-access) it does not show direct-IP connection attempts.
+
+Exit codes: `0` success, `1` usage error, `2` invalid value (malformed entry, `docker.io`, removing a non-runtime entry, a setting that cannot change, `network.allow` with `-u`, a host gateway conflict), `3` no running sandbox for the path (also: still starting, stopping, ambiguous without a terminal, or started by a Hole without `hole modify` — restart it), `4` the gateway could not apply the change and the previous allow list is still in force, `130` interrupted.
 
 ### Subnet pool
 
@@ -939,7 +1073,7 @@ Configured arguments expand `$VAR` the same way `environment` values do. Argumen
 | Hook | Runs where | When | On failure |
 |---|---|---|---|
 | `hooks.setupHost` | host | before any Docker work | aborts startup (`cleanupHost` still runs) |
-| `hooks.setup` | container, during the image build | when the image is built | aborts the build |
+| `hooks.setup` | container, during the image build | when the image is built | aborts the build at the first failing script |
 | `hooks.prestart` | container | every start, before the agent CLI | aborts startup |
 | `hooks.cleanupHost` | host | during teardown | logged, teardown continues |
 
@@ -975,7 +1109,54 @@ Sandboxes that Hole has already given up on (both their CLI and their watchdog a
 
 `hooks.setup` scripts are part of the image identity, so editing one rebuilds the image.
 
-> `cleanupHost` scripts normally run in Hole's detached teardown supervisor, which has **no TTY**. Their output goes to the run log; interactive scripts are not supported there.
+> `cleanupHost` scripts normally run in Hole's detached teardown supervisor, which has **no TTY**. Their output goes to the run log and to their own hook log; interactive scripts are not supported there.
+
+#### Hook logs
+
+Every hook script that runs gets its own log file with its complete output and, as the last line,
+how it ended — `exit code: 0`, `exit code: 3`, `killed by signal: SIGTERM`, or `exit code: unknown
+(…)` when its end was never seen. The files live next to the run log, in a directory of the same
+name (see [Logs](#logs)):
+
+```
+~/.hole/logs/run-20261019-101500-claude-4242/
+  setup-host-001-proxy.sh.log
+  build.log                          # full output of the image builds and compose
+  build-setup-001-node.sh.log
+  build-setup-002-java.sh.log
+  prestart-001-prestart.sh.log
+  cleanup-host-001-cleanup-host.sh.log
+```
+
+When a hook fails, Hole names the script, its exit code and the path of its log. The directory is
+readable only by you (hook output can contain tokens). Some things to know:
+
+- `setupHost` and `cleanupHost` output still reaches the console, but through a pipe: a script that
+  tests `[ -t 1 ]` no longer sees a terminal. A background process the script starts (an
+  `ssh-agent`, a `kubectl port-forward … &`) inherits that pipe; Hole stops waiting for it two
+  seconds after the script exits, and the process's later output is lost — redirect it to a file
+  if you need it.
+- Setup hooks get a log only when they actually run. When the image already exists or the build
+  step is cached, `build.log` says so instead.
+- The image builder truncates a step's output at 2 MiB (`BUILDKIT_STEP_LOG_MAX_SIZE`), so a very
+  chatty setup hook may lose its last lines and its exit code; its log then ends with `exit code:
+  unknown (…)` and Hole warns about it. Whether the build fails is still decided by the hook's real
+  exit code.
+- Prestart logs are read from the agent container when the sandbox is torn down, up to the moment
+  the agent CLI starts — nothing the agent prints reaches them. Colours and redrawn progress bars
+  are reduced to plain text. A container log driver that cannot be read back (`none`, `syslog`)
+  leaves no prestart logs.
+
+#### Image build progress
+
+While an image builds, Hole shows a compact progress line — the current step and setup hook, and
+the elapsed time — and a line per finished setup hook. Without a terminal (CI) it prints one line
+per build step instead. The raw build output always goes to `build.log`; to see it on the console
+as well, run with `-d`, or set `HOLE_BUILD_PROGRESS=plain` to keep everything else as it is:
+
+```bash
+HOLE_BUILD_PROGRESS=plain hole start claude . -r
+```
 
 ### Profiles
 
@@ -1103,6 +1284,7 @@ Then connect to `host.internal:5432` from inside the sandbox.
 | Path | Contents |
 |---|---|
 | `~/.hole/logs/run-<date>-<agent>-<pid>.log` | per-run debug log: every runtime command, timings, teardown detail (kept ~7 days) |
+| `~/.hole/logs/run-<date>-<agent>-<pid>/` | that run's [hook logs](#hook-logs) and `build.log` (kept ~7 days) |
 | `~/.hole/logs/<project>/network-access-<agent>-<id>.log` | the `-n` dump of resolved and refused domains |
 | `~/.hole/instances/` | one file per running sandbox, powering `hole list` |
 | `~/.hole/trust.json` | which projects' settings you accepted, see [project trust](#project-trust) |

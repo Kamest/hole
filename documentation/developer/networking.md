@@ -47,9 +47,18 @@ host  := exact domain     example.com
 ports := 1-65535, omitted → 443,80
 ```
 
-Ports apply to TCP and UDP alike. Entries for the same host merge their ports, and hosts are then
-grouped by **identical port set** — one group per unique set, named `g0`, `g1`, … in a
-deterministic order.
+Ports apply to TCP and UDP alike. Entries come in two **layers**: *base* (settings and agents'
+`allow.txt`, fixed at start) and *runtime* (added by [`hole modify`](#runtime-changes-hole-modify)).
+Entries for the same host merge their ports within a layer, and base hosts are then grouped by
+**identical port set** — one group per unique set. Each group's nftables set is named by content,
+`b_<hash>` (first 10 hex characters of SHA-256 over layer and port list), so adding an unrelated
+entry never renames a set and the addresses recorded in it survive. A runtime domain entry always
+gets a set of its own, `r_<hash>` over layer, port list and host: dnsmasq only ever *adds*
+addresses, so removing one entry of a shared set would leave its addresses reachable through the set
+that stays, while its own set is simply deleted. For the same reason base and runtime entries never
+share a set — runtime `github.com:80` next to base `github.com:22,443` is a separate set. Literal
+IP/CIDR entries go into a static interval set per group, `<b|r>_<hash>_static`, hashed over the
+elements too, so a changed address list is a new set rather than a flushed one.
 
 `hostGatewayDomains` entries merge the same way, and they have to: each one renders a CoreDNS
 server block, and CoreDNS refuses a Corefile that defines the same zone twice — so two entries for
@@ -138,8 +147,30 @@ in review.
 | File | Role |
 |---|---|
 | `Corefile` | policy front-end: a `view`-guarded root block forwarding to dnsmasq, `hostGatewayDomains` blocks answering the host gateway address, a catch-all NXDOMAIN block, a health zone, and `log` on the query blocks (which powers `-n`) |
-| `dnsmasq.conf` | `nftset=/<domain>/4#inet#hole#<set>` per domain, upstream `127.0.0.11` |
+| `dnsmasq.conf` | one `nftset=/<key>/4#inet#hole#<set>[,…]` line per domain key (see below), upstream `127.0.0.11` |
 | `nftables.rules` | one `inet hole` table: a dynamic set per group, a static interval set for IP/CIDR entries, forward chain with policy `drop`, masquerade on the internet interface, IPv6 dropped, rate-limited logging of denials |
+
+`Generate` also renders `nftables.apply`, the same ruleset in **in-place mode** for
+[`hole modify`](#runtime-changes-hole-modify): instead of `delete table` + full table it starts
+with `flush chain inet hole forward`, then declares the sets (nft creates missing ones and leaves
+existing ones and their elements alone) and re-declares the `forward` chain with its rules. One
+`nft -f` is one transaction, so there is no moment without rules. `input` and `postrouting` never
+change at runtime and are not in it; no set is flushed or destroyed there (flushing a set that does
+not exist yet fails the whole file, and `destroy` needs kernel 6.3) — unused sets are deleted by the
+apply script afterwards. Both modes are golden-tested.
+
+**dnsmasq rules.** dnsmasq uses exactly one `nftset=` line per query — the longest matching
+suffix — and an exact `x` and a wildcard `*.x` share the key `x`. The generator therefore emits one
+line per key `k` carrying the sets of exact entries for `k` and of wildcards whose host is `k` or a
+parent of `k`, so every name dnsmasq routes to line `k` feeds every set that may permit it
+(`nftsetRules`, `gateway.go`). Otherwise a runtime `api.github.com:8443` under a base
+`*.github.com` would lose the wildcard's ports for that name, and a tied exact/wildcard pair would
+produce two lines of which dnsmasq ignores one. The remaining over-grant is listed under
+[accepted limitations](#accepted-limitations).
+
+**Generation marker.** The health zone also answers `TXT` with the Corefile's generation (first 12
+hex characters of SHA-256 over the Corefile rendered without the marker), which is how a runtime
+apply confirms that CoreDNS reloaded. The healthcheck (`A`) is unaffected.
 
 Placeholders `{HOST_GATEWAY_IP}`, `{SANDBOX_IF}` and `{INTERNET_IF}` are substituted by the
 gateway entrypoint.
@@ -301,6 +332,69 @@ Docker's own rules.
 CoreDNS forwards everything unconditionally, dnsmasq drops its nftset lines, and the forward chain
 policy becomes `accept`. Masquerading stays, since the sandbox still has no route of its own.
 
+## Runtime changes (`hole modify`)
+
+`hole modify` changes `network.allow` and `network.hostGatewayDomains` of a **running** sandbox
+(`internal/sandbox/modify.go`). There is still one generator: the CLI re-renders the complete
+configuration from the base entries recorded in the instance state plus the runtime entries, and the
+running gateway applies it **in place** — the container is never recreated, because a new container
+would lose its conntrack/NAT state (every open connection, including the agent's in-flight API
+request) and every address dnsmasq recorded. Every apply sends the complete desired configuration,
+so any apply also repairs an earlier partial one.
+
+**Transport.** `docker exec -i <instance>-gateway-1 hole-gateway-apply` with a tar stream on stdin
+(`engine.ExecInput`). The host-side files are single-file bind mounts, which do not see an atomic
+rename and behave differently on VM-based engines; `exec` works the same everywhere. No listener,
+file or channel the agent could reach is added, and `exec` reuses the gateway's existing
+`NET_ADMIN`.
+
+**Payload.** `Corefile`, `dnsmasq.conf` and the start-mode `nftables.rules` of the new
+configuration; `open.nft`, the in-place ruleset for base ∪ previous ∪ new runtime entries;
+`final.nft`, the in-place ruleset for base ∪ new runtime entries; and
+`previous/{Corefile,dnsmasq.conf,apply.nft}` for rollback.
+
+**Order** (`assets/gateway/hole-gateway-apply`, fail-closed). Under `flock /run/hole-apply.lock`:
+validate first (`dnsmasq --test`, `nft -c -f` of both rulesets — exit 11, nothing changed), and
+refuse a host gateway zone without a usable address (exit 10). Then `open.nft` → restart dnsmasq if
+its file changed → reload CoreDNS if the Corefile changed → `final.nft` → delete the `b_*`/`r_*`
+sets `final.nft` no longer declares. A name never resolves before its addresses can be recorded and
+permitted, and a removed name stops resolving before its rules go — also for a mixed add + remove.
+A failure in those steps re-runs them with `previous/` (exit 12); if even that fails, exit 13 — the
+gateway may be left in the "open" state, and re-running any `modify` re-converges it.
+`TestGatewayApplyOrder` (`assets/assets_test.go`) pins the order.
+
+- **dnsmasq** cannot reload `nftset=` lines, so it is restarted. The entrypoint runs it under a
+  supervising loop that records each PID in `/run/hole-dnsmasq.pid`; the apply kills that PID,
+  waits until it is gone and the new dnsmasq answers `version.bind CH TXT` on port 5353. The kernel
+  sets survive the restart. A side benefit: a crashed dnsmasq now comes back.
+- **CoreDNS** is reloaded with `SIGUSR1` to PID 1, which is graceful: an invalid Corefile keeps the
+  old configuration. The apply polls the health zone's `TXT` answer until it carries the new
+  [generation](#generated-per-run-artifacts); a reload that never gets there is a failure.
+
+**Lifetime.** After a successful apply the script stores the unsubstituted `Corefile`,
+`dnsmasq.conf` and `nftables.rules` in the container's own writable layer —
+`/var/lib/hole/runtime.<random>/`, then an atomic symlink swap of `/var/lib/hole/runtime`. When
+Docker restarts the gateway container (`restart: on-failure`), the entrypoint reads that directory
+instead of `/etc/hole/` when all three files are present. Teardown removes the container and its
+layer, so a new `hole start` always begins with the base list.
+
+**Host side.** The base entries (with their sources) and the runtime entries live in
+`state.Instance` (see [architecture](architecture.md#runtime-changes-and-the-instance-lock)), so listing, removing and
+re-rendering never depend on settings files or agents' `allow.txt` changing mid-run. Validation
+before anything is applied: entries parse, `docker.io`/`*.docker.io` are refused (the
+[capability token](#docker-hub-is-a-capability-token) is a start-time decision), `network.allow`
+under `-u` is refused, and host gateway shadowing is refused both ways (a runtime zone over an
+effective allow entry, a runtime allow entry under any zone — `HostGatewayConflicts`). The gateway
+must be `healthy`: an apply racing a restarting entrypoint would be undone by its `delete table`.
+
+**Blocked names** (`list-blocked`) come from the gateway's CoreDNS log (`docker logs -t`; `log` is
+always on): a name is blocked when it has an `NXDOMAIN` line **and** the current policy does not
+match it (`Policy.Matches`, which mirrors the Corefile regex), so a stale NXDOMAIN from before a
+runtime change and an upstream NXDOMAIN of an allowed name are both left out. Names are lowercased,
+deduplicated, stripped of one trailing dot; reverse zones, the health zone and anything that is not
+a valid domain name (which also drops control characters and terminal escapes) are dropped. The
+CoreDNS line parser is shared with the `-n` dump (`parseCoreDNSQuery`).
+
 ## Subnet allocation
 
 `network.subnetPool` (default `10.222.0.0/16`, minimum `/23`) is Hole's own pool. Each instance
@@ -340,9 +434,18 @@ they do not appear in the dump. The nftables counter records them for debugging
   for the sandbox's lifetime — nftset entries do not expire, because expiry would break
   long-lived connections on re-resolution. An agent could therefore reach a *different* site on
   the same address, which is common with CDNs. Future hardening is SNI verification on TLS flows.
-- **dnsmasq's suffix matching across port groups.** If `example.com:22` and `api.example.com:443`
-  are both allowed, dnsmasq's suffix match adds `api.example.com`'s addresses to the `:22` group
-  as well. This is a strict subset of the shared-address limitation above.
+- **Names sharing a dnsmasq key share sets.** dnsmasq routes every name to one `nftset=` line,
+  and that line feeds all sets that may permit *some* name routed to it. With `x` and `*.x` both
+  allowed (on different port sets), the apex addresses of `x` land in the set of `*.x` and vice
+  versa. With `*.example.com:443` and `api.example.com:8080`, `foo.api.example.com` (permitted by
+  the wildcard) is routed to the `api.example.com` line and lands in the `:8080` set too. Without a
+  wildcard there is no leak: `example.com:22` next to `api.example.com:443` stay apart. This is a
+  strict subset of the shared-address limitation above.
+- **A removed runtime entry can leave addresses in a base set.** Its own set is deleted, but when
+  it shared a dnsmasq key with a base entry (runtime `github.com:443` next to base
+  `*.github.com:443`), the addresses its names resolved to were also recorded in the base set and
+  stay reachable on the base entry's ports until the sandbox ends. dnsmasq cannot tell apex from
+  subdomain on one key, so the generator cannot avoid it.
 - **CNAME chains** work without allowing the CDN vendor: dnsmasq records every address from the
   chased answer.
 - **UDP** is stateful via conntrack, so QUIC to an allowed `host:443` works.

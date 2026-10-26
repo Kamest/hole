@@ -7,6 +7,8 @@
 package sandbox
 
 import (
+	"bytes"
+	"io"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -500,5 +502,146 @@ func TestAttachReportsTheContainersStatusNotTheAttachClients(t *testing.T) {
 				t.Errorf("attach reported %d, want %d (the container's own status)", code, test.wantCode)
 			}
 		})
+	}
+}
+
+// Regression: startup used to write the state file before taking the liveness lock, and in that
+// window (no lock, no watchdog yet) a concurrent `hole list` collected the starting sandbox.
+func TestGCSparesAnInstanceThatHoldsItsLivenessBeforeTheWatchdogStarts(t *testing.T) {
+	containerEngine := testEngine(t)
+	host, store := testHostAndStore(t)
+
+	// The current order: liveness first, then the state write, watchdog not started yet.
+	starting := fabricate(t, containerEngine, store, "early0", 140, false)
+	release, err := store.HoldLiveness(starting.InstanceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	starting.WatchdogPID = 0
+	starting.Phase = state.PhaseStarting
+	if err := store.Write(starting); err != nil {
+		t.Fatal(err)
+	}
+
+	// The old order: the state write without the lock. GC must see it as abandoned, or this test
+	// would not cover the window at all.
+	oldOrder := fabricate(t, containerEngine, store, "early1", 150, false)
+	oldOrder.WatchdogPID = 0
+	if err := store.Write(oldOrder); err != nil {
+		t.Fatal(err)
+	}
+
+	GC(containerEngine, host, store)
+
+	if !store.Exists(starting.InstanceName) {
+		t.Error("GC deregistered an instance that holds its liveness lock")
+	}
+	if _, err := os.Stat(starting.RunTmpDir); err != nil {
+		t.Error("GC removed the run directory of a starting instance")
+	}
+	for _, name := range starting.Networks {
+		if !containerEngine.NetworkExists(name) {
+			t.Errorf("GC removed network %s of a starting instance", name)
+		}
+	}
+	if store.Exists(oldOrder.InstanceName) {
+		t.Error("an instance registered without its liveness lock was not collected; the test no longer covers the window")
+	}
+}
+
+func TestListNoGCLeavesAbandonedInstanceInPlace(t *testing.T) {
+	containerEngine := testEngine(t)
+	host, store := testHostAndStore(t)
+	// List detects the host itself, so point it at the test registry.
+	t.Setenv("HOME", host.Home)
+
+	abandoned := fabricate(t, containerEngine, store, "nogc00", 160, false)
+	abandoned.CLIPID = deadPID
+	abandoned.WatchdogPID = deadPID
+	if err := store.Write(abandoned); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := List(&out, ListOptions{JSON: true, NoGC: true}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if out.String() != "[]\n" {
+		t.Errorf("List output = %q, want an empty array: abandoned instances are never listed", out.String())
+	}
+	if !store.Exists(abandoned.InstanceName) {
+		t.Error("List with NoGC collected the abandoned instance")
+	}
+	for _, name := range abandoned.Networks {
+		if !containerEngine.NetworkExists(name) {
+			t.Errorf("List with NoGC removed network %s", name)
+		}
+	}
+
+	if err := List(io.Discard, ListOptions{JSON: true}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if store.Exists(abandoned.InstanceName) {
+		t.Error("List without NoGC did not collect the abandoned instance")
+	}
+	for _, name := range abandoned.Networks {
+		if containerEngine.NetworkExists(name) {
+			t.Errorf("List without NoGC left network %s behind", name)
+		}
+	}
+}
+
+func TestTeardownMarksStoppingBeforeRemoving(t *testing.T) {
+	containerEngine := testEngine(t)
+	host, store := testHostAndStore(t)
+	instance := fabricate(t, containerEngine, store, "stop00", 170, false)
+
+	// cleanupHost runs late in teardown, so it sees what a polling caller sees meanwhile.
+	seen := filepath.Join(instance.ProjectPath, "stopping-seen")
+	stoppingMarker := filepath.Join(store.Dir(), instance.InstanceName+".stopping")
+	script := "#!/bin/bash\n[ -e \"" + stoppingMarker + "\" ] && touch \"" + seen + "\"\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(instance.ProjectPath, "cleanup.sh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	instance.Settings = []byte(`{"hooks":{"cleanupHost":[{"script":"cleanup.sh"}]}}`)
+	if err := store.Write(instance); err != nil {
+		t.Fatal(err)
+	}
+
+	Teardown(containerEngine, host, store, instance)
+
+	if _, err := os.Stat(seen); err != nil {
+		t.Error("the instance was not marked stopping while teardown ran")
+	}
+	if store.Stopping(instance.InstanceName) {
+		t.Error("the stopping marker survived teardown")
+	}
+}
+
+func TestStartRejectsATwinInstanceIDWithoutLeftovers(t *testing.T) {
+	testEngine(t)
+	host, store := testHostAndStore(t)
+	// Start detects the host itself, so point it at the test registry.
+	t.Setenv("HOME", host.Home)
+
+	projectDir := t.TempDir()
+	instanceName := hostenv.InstanceName(hostenv.ProjectName(projectDir), "twin00")
+	// The twin holds the lock but has not written its state yet, so only the lock can reject.
+	release, err := store.HoldLiveness(instanceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	_, err = Start(Options{Agent: "claude", ProjectDir: projectDir, InstanceID: "twin00"})
+	if err == nil || !strings.Contains(err.Error(), "instance ID 'twin00' is already in use") {
+		t.Fatalf("Start error = %v, want the instance ID to be rejected as in use", err)
+	}
+	if entries, err := os.ReadDir(host.TmpRoot()); err == nil && len(entries) > 0 {
+		t.Errorf("a rejected start left %d run temp directories behind", len(entries))
+	}
+	if store.Exists(instanceName) {
+		t.Error("a rejected start registered the instance")
 	}
 }

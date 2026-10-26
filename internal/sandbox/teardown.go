@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"strconv"
 	"syscall"
@@ -36,6 +37,11 @@ func Teardown(containerEngine *engine.Engine, host hostenv.Host, store *state.St
 			return
 		}
 	}
+	// Before the first slow step, so a caller polling `hole list --json` sees it promptly. The
+	// Exists check keeps an unlocked teardown of a removed instance from leaving a stray marker.
+	if store.Exists(instance.InstanceName) {
+		store.MarkStopping(instance.InstanceName)
+	}
 
 	// Re-read the registry: startup records each resource as it is created, so a supervisor
 	// that read the file earlier holds a snapshot with no networks or volume in it — and
@@ -49,6 +55,8 @@ func Teardown(containerEngine *engine.Engine, host hostenv.Host, store *state.St
 	// creates the agent container while it waits for the gateway, so existence alone would
 	// claim a session for a startup that failed before the agent ever ran.
 	agentRan := containerEngine.ContainerStarted(instance.InstanceName + "-agent-1")
+
+	writePrestartLogs(containerEngine, instance)
 
 	if instance.Flags.DumpNetworkAccess && containerEngine.ContainerExists(instance.InstanceName+"-gateway-1") {
 		writeNetworkAccessDump(containerEngine, host, instance)
@@ -175,7 +183,7 @@ func runCleanupHostHooks(host hostenv.Host, instance *state.Instance, lastInstan
 		return
 	}
 	scripts := hooks.Resolve(settings.Hooks.CleanupHost, host, instance.ProjectPath, "cleanupHost")
-	hooks.RunCleanupHost(scripts, cleanupHookEnvironment(host, instance, lastInstance))
+	hooks.RunCleanupHost(scripts, cleanupHookEnvironment(host, instance, lastInstance), hooks.RunLogDir(instance.LogFile))
 }
 
 // verifyRemoved is the final check: anything still matching this instance is reported with
@@ -227,6 +235,29 @@ func lockInstance(path string) (func(), bool) {
 		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 		_ = file.Close()
 	}, true
+}
+
+// tryLockInstance takes the teardown lock without waiting. busy reports that another holder has
+// it, meaning a teardown is running. Any other failure returns a no-op unlock and busy false, so
+// the caller proceeds unlocked — the same tolerance Teardown has.
+func tryLockInstance(path string) (unlock func(), busy bool) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		logging.Debug("could not open teardown lock %s: %v", path, err)
+		return func() {}, false
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return func() {}, true
+		}
+		logging.Debug("could not acquire teardown lock %s: %v", path, err)
+		return func() {}, false
+	}
+	return func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+	}, false
 }
 
 // hookEnvironment is the environment Hole exports to host-side hook scripts.

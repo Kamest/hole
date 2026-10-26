@@ -4,7 +4,8 @@ FROM ${BASE_IMAGE}
 
 LABEL com.hole.image=agent
 
-# Use bash with pipefail so any failed command in a pipe aborts the build
+# Use bash with pipefail so any failed command in a pipe aborts the build. There is no -e, so every
+# loop below exits on a failing iteration itself: a loop's status is only that of its last command.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG UID=1000
@@ -60,7 +61,7 @@ RUN for agent_dir in /tmp/agent-installs/*/; do \
       agent=$(basename "${agent_dir}"); \
       if [ -f "/tmp/agent-installs/${agent}/install-root.sh" ]; then \
         chmod +x "/tmp/agent-installs/${agent}/install-root.sh" \
-        && "/tmp/agent-installs/${agent}/install-root.sh"; \
+        && "/tmp/agent-installs/${agent}/install-root.sh" || exit $?; \
       fi; \
     done
 
@@ -75,7 +76,7 @@ RUN for agent_dir in /tmp/agent-installs/*/; do \
       agent=$(basename "${agent_dir}"); \
       if [ -f "/tmp/agent-installs/${agent}/install-user.sh" ]; then \
         chown "${AGENT_USERNAME}" "/tmp/agent-installs/${agent}/install-user.sh" && \
-        chmod +x "/tmp/agent-installs/${agent}/install-user.sh"; \
+        chmod +x "/tmp/agent-installs/${agent}/install-user.sh" || exit $?; \
       fi; \
     done
 
@@ -96,15 +97,19 @@ RUN echo '[ -s "${BASH_ENV}" ] && . "${BASH_ENV}"' >> "${AGENT_HOME}/.bashrc"
 RUN for agent_dir in /tmp/agent-installs/*/; do \
       agent=$(basename "${agent_dir}"); \
       if [ -f "/tmp/agent-installs/${agent}/install-user.sh" ]; then \
-        "/tmp/agent-installs/${agent}/install-user.sh"; \
+        "/tmp/agent-installs/${agent}/install-user.sh" || exit $?; \
       fi; \
     done
 
-## Execute user setup hook scripts in lexicographic order
+## Execute user setup hook scripts in lexicographic order. The markers let Hole split the build
+## output into one log per script; the loop's own exit, not the markers, decides the build.
 RUN for script in /tmp/setup-scripts/*.sh; do \
       [ -f "${script}" ] || continue; \
-      echo "Running setup hook: $(basename "${script}")..."; \
-      "${script}"; \
+      name="$(basename "${script}")"; \
+      echo "::hole-hook-begin setup ${name}::"; \
+      "${script}"; rc=$?; \
+      echo "::hole-hook-end setup ${name} exit=${rc}::"; \
+      [ "${rc}" -eq 0 ] || exit "${rc}"; \
     done
 
 USER root

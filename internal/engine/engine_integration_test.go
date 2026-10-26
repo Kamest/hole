@@ -392,8 +392,11 @@ func TestAttachWithoutATerminal(t *testing.T) {
 			_ = engine.ContainerRemove(container)
 			t.Cleanup(func() { _ = engine.ContainerRemove(container) })
 
+			// The container must still be running when `attach` reaches the daemon. Against a
+			// remote daemon (DOCKER_HOST=tcp://…) each CLI call alone takes about a second, so
+			// a one-second lifetime ended before the attach and the runtime refused it.
 			args := append([]string{"run", "-d"}, test.runFlags...)
-			args = append(args, "--name", container, "alpine:3.19", "sh", "-c", "sleep 1; exit 7")
+			args = append(args, "--name", container, "alpine:3.19", "sh", "-c", "sleep 5; exit 7")
 			if err := engine.RunQuiet(args...); err != nil {
 				t.Skipf("could not start a container: %v", err)
 			}
@@ -537,5 +540,118 @@ func TestImageUntagWhileAContainerUsesTheImage(t *testing.T) {
 	}
 	if !engine.ContainerRunning(container) {
 		t.Error("untagging stopped the container using the image")
+	}
+}
+
+func TestContainerLogLines(t *testing.T) {
+	engine := testEngine(t)
+	if err := engine.RunQuiet("pull", "alpine:3.19"); err != nil {
+		t.Skipf("could not pull alpine: %v", err)
+	}
+	tests := []struct {
+		name     string
+		runFlags []string
+	}{
+		{name: "plain"},
+		// A TTY container's log ends lines in \r\n.
+		{name: "tty", runFlags: []string{"-t"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			container := testLabelValue + "-loglines-" + test.name
+			_ = engine.ContainerRemove(container)
+			t.Cleanup(func() { _ = engine.ContainerRemove(container) })
+			args := append([]string{"run", "-d"}, test.runFlags...)
+			args = append(args, "--name", container, "alpine:3.19", "sh", "-c", "echo one; echo two; echo three")
+			if err := engine.RunQuiet(args...); err != nil {
+				t.Skipf("could not start a container: %v", err)
+			}
+			if _, err := engine.ContainerWait(container); err != nil {
+				t.Fatal(err)
+			}
+
+			var all []string
+			if err := engine.ContainerLogLines(container, func(line string) bool {
+				all = append(all, line)
+				return true
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(all, "|") != "one|two|three" {
+				t.Errorf("lines = %q", all)
+			}
+
+			var head []string
+			if err := engine.ContainerLogLines(container, func(line string) bool {
+				head = append(head, line)
+				return line != "two"
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(head, "|") != "one|two" {
+				t.Errorf("an early stop must end the stream there, got %q", head)
+			}
+		})
+	}
+
+	if err := engine.ContainerLogLines(testLabelValue+"-no-such-container", func(string) bool { return true }); err == nil {
+		t.Error("reading the log of a missing container must fail")
+	}
+}
+
+// ExecInput is how `hole modify` ships a configuration into the gateway: stdin must reach the
+// command, and the command's own exit code must come back as a result rather than an error.
+func TestExecInput(t *testing.T) {
+	engine := testEngine(t)
+	if err := engine.RunQuiet("pull", "alpine:3.19"); err != nil {
+		t.Skipf("could not pull alpine: %v", err)
+	}
+	container := testLabelValue + "-execinput"
+	_ = engine.ContainerRemove(container)
+	t.Cleanup(func() { _ = engine.ContainerRemove(container) })
+	if err := engine.RunQuiet("run", "-d", "--name", container, "alpine:3.19", "sh", "-c", "sleep 120"); err != nil {
+		t.Skipf("could not start a container: %v", err)
+	}
+
+	stdout, _, code, err := engine.ExecInput(container, strings.NewReader("round trip\n"), "cat")
+	if err != nil || code != 0 || stdout != "round trip\n" {
+		t.Errorf("ExecInput(cat) = %q, %d, %v", stdout, code, err)
+	}
+	_, stderr, code, err := engine.ExecInput(container, strings.NewReader(""), "sh", "-c", "echo broken >&2; exit 12")
+	if err != nil {
+		t.Fatalf("a non-zero exit is a result, not an error: %v", err)
+	}
+	if code != 12 || stderr != "broken\n" {
+		t.Errorf("ExecInput exit = %d, stderr %q; want 12, %q", code, stderr, "broken\n")
+	}
+}
+
+func TestContainerLogsTimestamped(t *testing.T) {
+	engine := testEngine(t)
+	if err := engine.RunQuiet("pull", "alpine:3.19"); err != nil {
+		t.Skipf("could not pull alpine: %v", err)
+	}
+	container := testLabelValue + "-logs-timestamped"
+	_ = engine.ContainerRemove(container)
+	t.Cleanup(func() { _ = engine.ContainerRemove(container) })
+	before := time.Now().Add(-time.Minute)
+	if err := engine.RunQuiet("run", "-d", "--name", container, "alpine:3.19", "sh", "-c", "echo one; echo two"); err != nil {
+		t.Skipf("could not start a container: %v", err)
+	}
+	if _, err := engine.ContainerWait(container); err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	if err := engine.ContainerLogsTimestamped(container, func(ts time.Time, line string) bool {
+		if ts.Before(before) || ts.After(time.Now().Add(time.Minute)) {
+			t.Errorf("timestamp %v of %q is implausible", ts, line)
+		}
+		lines = append(lines, line)
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(lines, "|") != "one|two" {
+		t.Errorf("lines = %q", lines)
 	}
 }

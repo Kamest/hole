@@ -4,11 +4,13 @@ package hooks
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/lukashornych/hole/v2/internal/config"
 	"github.com/lukashornych/hole/v2/internal/hostenv"
@@ -101,12 +103,17 @@ func expandPathGlob(pattern string) []string {
 }
 
 // RunSetupHost runs the setupHost scripts in order. A failure aborts startup — the sandbox
-// would otherwise run without whatever the hook was supposed to prepare.
-func RunSetupHost(scripts []Script, extraEnv []string) error {
-	for _, script := range scripts {
+// would otherwise run without whatever the hook was supposed to prepare. With a logDir, each
+// script's output and exit code also go to its own log file there.
+func RunSetupHost(scripts []Script, extraEnv []string, logDir string) error {
+	for i, script := range scripts {
 		logging.Info("Running setupHost hook: %s...", script.Name())
-		if err := runScript(script, extraEnv); err != nil {
-			return fmt.Errorf("setupHost hook '%s' failed: %w", script.Name(), err)
+		outcome, logPath := runScript(script, i, LogKindSetupHost, extraEnv, logDir)
+		if outcome.StartErr != nil {
+			return fmt.Errorf("setupHost hook '%s'%s: %w", script.Name(), logHint(logPath), outcome.StartErr)
+		}
+		if outcome.ExitCode != 0 {
+			return fmt.Errorf("setupHost hook '%s' %s%s", script.Name(), outcome.Describe(), logHint(logPath))
 		}
 	}
 	return nil
@@ -114,20 +121,57 @@ func RunSetupHost(scripts []Script, extraEnv []string) error {
 
 // RunCleanupHost runs the cleanupHost scripts during teardown. Teardown never aborts, so a
 // failing script is only warned about.
-func RunCleanupHost(scripts []Script, extraEnv []string) {
-	for _, script := range scripts {
+func RunCleanupHost(scripts []Script, extraEnv []string, logDir string) {
+	for i, script := range scripts {
 		logging.Info("Running cleanupHost hook: %s...", script.Name())
-		if err := runScript(script, extraEnv); err != nil {
-			logging.Warn("cleanupHost hook '%s' exited non-zero; continuing teardown", script.Name())
+		outcome, logPath := runScript(script, i, LogKindCleanupHost, extraEnv, logDir)
+		if outcome.ExitCode != 0 {
+			logging.Warn("cleanupHost hook '%s' %s%s; continuing teardown", script.Name(), outcome.Describe(), logHint(logPath))
 		}
 	}
 }
 
-func runScript(script Script, extraEnv []string) error {
+// hookOutputGrace is how long a finished script's output pipe may stay open. A background
+// process the script started (an ssh-agent, a port-forward) inherits the pipe, and without a
+// bound Run would wait for that process to exit — hanging the start, or teardown.
+const hookOutputGrace = 2 * time.Second
+
+// runScript runs one host-side script, its output going to the console and, when logDir is set,
+// to the script's log file. Both share one writer, so stdout and stderr keep their interleaving.
+// That makes them pipes: a script deciding on `[ -t 1 ]` sees no terminal.
+func runScript(script Script, index int, kind string, extraEnv []string, logDir string) (Outcome, string) {
 	cmd := exec.Command("bash", script.Path)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
 	cmd.Env = append(os.Environ(), extraEnv...)
-	return cmd.Run()
+
+	var hookLog *Log
+	if logDir != "" {
+		var err error
+		hookLog, err = CreateLog(logDir, kind, fmt.Sprintf("%03d-%s", index+1, script.Name()), script.Path, extraEnv)
+		if err != nil {
+			logging.Warn("could not create the log of hook '%s': %v", script.Name(), err)
+		} else {
+			output := io.MultiWriter(os.Stderr, hookLog)
+			cmd.Stdout = output
+			cmd.Stderr = output
+			cmd.WaitDelay = hookOutputGrace
+		}
+	}
+
+	outcome := outcomeOf(cmd.Run())
+	if hookLog == nil {
+		return outcome, ""
+	}
+	hookLog.Finish(outcome.Trailer())
+	return outcome, hookLog.Path
+}
+
+// logHint points a failure message at the script's log file.
+func logHint(logPath string) string {
+	if logPath == "" {
+		return ""
+	}
+	return " (log: " + logPath + ")"
 }

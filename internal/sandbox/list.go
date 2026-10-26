@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -14,11 +15,62 @@ import (
 	"github.com/lukashornych/hole/v2/internal/state"
 )
 
-// List prints the running sandboxes.
+// ListOptions selects the output of List.
+type ListOptions struct {
+	// JSON prints the machine-readable `hole list --json` document instead of the table.
+	JSON bool
+	// NoGC skips garbage collection, for callers that poll and must not keep the engine busy.
+	NoGC bool
+	// InstanceID lists only this instance; empty lists all.
+	InstanceID string
+}
+
+// listEntry is one element of `hole list --json`. Its field names are a public contract: add
+// fields, never rename or remove them. It is kept apart from state.Instance so a change to the
+// registry file can never rename a public field.
+type listEntry struct {
+	InstanceID    string    `json:"instanceId"`
+	InstanceName  string    `json:"instanceName"`
+	Status        string    `json:"status"`
+	Agent         string    `json:"agent"`
+	Profile       string    `json:"profile"`
+	ProjectPath   string    `json:"projectPath"`
+	ProjectName   string    `json:"projectName"`
+	StartedAt     string    `json:"startedAt"`
+	UptimeSeconds int64     `json:"uptimeSeconds"`
+	Docker        bool      `json:"docker"`
+	Networks      []string  `json:"networks"`
+	Settings      []string  `json:"settings"`
+	SettingsFiles []string  `json:"settingsFiles"`
+	Flags         listFlags `json:"flags"`
+	PID           int       `json:"pid"`
+	Version       string    `json:"version"`
+	// RuntimeEntryCount counts the entries `hole modify` added to the running sandbox.
+	RuntimeEntryCount int `json:"runtimeEntryCount"`
+}
+
+// listFlags is the `flags` object of listEntry, part of the same public contract.
+type listFlags struct {
+	Debug             bool `json:"debug"`
+	Rebuild           bool `json:"rebuild"`
+	Unrestricted      bool `json:"unrestricted"`
+	DumpNetworkAccess bool `json:"dumpNetworkAccess"`
+	WithDocker        bool `json:"withDocker"`
+}
+
+// Lifecycle statuses reported by `hole list --json`.
+const (
+	statusStarting = "starting"
+	statusRunning  = "running"
+	statusStopping = "stopping"
+)
+
+// List prints the running sandboxes, as a table or as JSON.
 //
 // The registry is cross-checked against live containers, so an instance whose resources are
-// gone is collected on the spot rather than reported as running.
-func List(out io.Writer) error {
+// gone is collected on the spot rather than reported as running. With NoGC that collection is
+// skipped, but abandoned instances are still left out of the output.
+func List(out io.Writer, opts ListOptions) error {
 	host := hostenv.DetectHost()
 	store, err := state.NewStore(host.InstancesDir())
 	if err != nil {
@@ -29,34 +81,126 @@ func List(out io.Writer) error {
 		return err
 	}
 
-	GC(containerEngine, host, store)
+	if !opts.NoGC {
+		GC(containerEngine, host, store)
+	}
 
 	instances, err := store.List()
 	if err != nil {
 		return err
 	}
 
-	running := runningInstances(store, instances)
+	running := filterByInstanceID(runningInstances(store, instances), opts.InstanceID)
 
+	if opts.JSON {
+		return writeListJSON(out, host, store, running)
+	}
 	if len(running) == 0 {
-		logging.Info("No sandboxes are running.")
+		if opts.InstanceID != "" {
+			logging.Info("No sandbox with instance ID '%s' is running.", opts.InstanceID)
+		} else {
+			logging.Info("No sandboxes are running.")
+		}
 		return nil
 	}
+	return writeListTable(out, host, running)
+}
 
+// filterByInstanceID keeps only the instance with the given ID; an empty ID keeps all.
+func filterByInstanceID(instances []*state.Instance, instanceID string) []*state.Instance {
+	if instanceID == "" {
+		return instances
+	}
+	var matching []*state.Instance
+	for _, instance := range instances {
+		if instance.InstanceID == instanceID {
+			matching = append(matching, instance)
+		}
+	}
+	return matching
+}
+
+func writeListTable(out io.Writer, host hostenv.Host, running []*state.Instance) error {
 	writer := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(writer, "INSTANCE\tAGENT\tPROJECT\tUPTIME\tDOCKER\tNETWORK\tSETTINGS")
+	_, _ = fmt.Fprintln(writer, "INSTANCE\tAGENT\tPROJECT\tUPTIME\tDOCKER\tNETWORK\tRUNTIME\tSETTINGS")
 	for _, instance := range running {
-		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
 			instance.InstanceID,
 			agentLabel(instance),
 			instance.ProjectPath,
 			formatUptime(instance.Uptime()),
 			yesNo(instance.DinDEnabled),
 			firstOr(instance.Networks, "-"),
-			settingsLabel(host, instance),
+			runtimeEntryCount(instance),
+			strings.Join(settingsLabels(host, instance), "+"),
 		)
 	}
 	return writer.Flush()
+}
+
+// writeListJSON writes the `hole list --json` document. It always writes an array, `[]` when
+// nothing runs, and encodes everything before writing so an error leaves stdout empty.
+func writeListJSON(out io.Writer, host hostenv.Host, store *state.Store, running []*state.Instance) error {
+	entries := make([]listEntry, 0, len(running))
+	for _, instance := range running {
+		entries = append(entries, listEntry{
+			InstanceID:    instance.InstanceID,
+			InstanceName:  instance.InstanceName,
+			Status:        instanceStatus(store, instance),
+			Agent:         instance.Agent,
+			Profile:       instance.Profile,
+			ProjectPath:   instance.ProjectPath,
+			ProjectName:   instance.ProjectName,
+			StartedAt:     instance.StartedAt.Format(time.RFC3339),
+			UptimeSeconds: int64(instance.Uptime() / time.Second),
+			Docker:        instance.DinDEnabled,
+			Networks:      nonNil(instance.Networks),
+			Settings:      settingsLabels(host, instance),
+			SettingsFiles: nonNil(instance.SettingsFiles),
+			Flags: listFlags{
+				Debug:             instance.Flags.Debug,
+				Rebuild:           instance.Flags.Rebuild,
+				Unrestricted:      instance.Flags.Unrestricted,
+				DumpNetworkAccess: instance.Flags.DumpNetworkAccess,
+				WithDocker:        instance.Flags.WithDocker,
+			},
+			PID:               instance.CLIPID,
+			Version:           instance.Version,
+			RuntimeEntryCount: runtimeEntryCount(instance),
+		})
+	}
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode sandbox list: %w", err)
+	}
+	_, err = out.Write(append(data, '\n'))
+	return err
+}
+
+// runtimeEntryCount is how many entries `hole modify` added to a running sandbox.
+func runtimeEntryCount(instance *state.Instance) int {
+	return len(instance.RuntimeAllow) + len(instance.RuntimeHostGatewayDomains)
+}
+
+// instanceStatus is the lifecycle status `hole list --json` reports. The stopping marker wins
+// over the phase, so a signal during startup reports stopping even if the CLI records running
+// afterwards. Instances from older Hole versions have no phase and are running.
+func instanceStatus(store *state.Store, instance *state.Instance) string {
+	switch {
+	case store.Stopping(instance.InstanceName):
+		return statusStopping
+	case instance.Phase == state.PhaseStarting:
+		return statusStarting
+	default:
+		return statusRunning
+	}
+}
+
+func nonNil(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 // runningInstances drops the instances GC has already torn down.
@@ -82,13 +226,13 @@ func agentLabel(instance *state.Instance) string {
 	return instance.Agent
 }
 
-// settingsLabel names which settings documents were merged for the run. The global document is
+// settingsLabels names which settings documents were merged for the run. The global document is
 // named by the path the run recorded, not by the listing process's GlobalSettingsFile: a run
 // started with HOLE_SETTINGS_FILE read a different file than a plain `hole list` would assume.
 // A HOLE_PROJECT_SETTINGS_FILE override is named by path too; the in-repo file stays `project`.
-func settingsLabel(host hostenv.Host, instance *state.Instance) string {
+func settingsLabels(host hostenv.Host, instance *state.Instance) []string {
 	if len(instance.SettingsFiles) == 0 {
-		return "defaults"
+		return []string{"defaults"}
 	}
 	labels := make([]string, 0, len(instance.SettingsFiles))
 	for _, file := range instance.SettingsFiles {
@@ -102,7 +246,7 @@ func settingsLabel(host hostenv.Host, instance *state.Instance) string {
 		}
 		labels = append(labels, "global("+abbreviateHome(host, file)+")")
 	}
-	return strings.Join(labels, "+")
+	return labels
 }
 
 // abbreviateHome shortens a path under the host home to its `~/` form.

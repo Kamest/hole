@@ -58,7 +58,17 @@ type Options struct {
 	AgentArgs []string
 	// LogFile is the run log the watchdog appends to and the CLI relays from.
 	LogFile string
+	// InstanceID is a caller-chosen instance ID, already format-validated; empty means generate
+	// one.
+	InstanceID string
 }
+
+// errInterrupted ends a start that a signal interrupted before the agent container was up.
+var errInterrupted = errors.New("interrupted, sandbox not started")
+
+// errInterruptedBeforeAttach ends a start that a signal interrupted after the agent container
+// came up but before the terminal was attached.
+var errInterruptedBeforeAttach = errors.New("interrupted before attaching to the agent, destroying sandbox")
 
 // Start creates the sandbox, attaches the terminal to the agent and tears everything down
 // when the agent exits. It returns the exit code the CLI should use.
@@ -72,15 +82,22 @@ func Start(opts Options) (exitCode int, err error) {
 			exitCode = int(code)
 		}
 	}()
+	// Registered first, so a signal from here on is buffered for watchSignals instead of killing
+	// the process with nothing cleaned up.
+	signals := notifySignals()
+	interrupted := func() bool { return signalled.Load() != 0 }
 
 	host := hostenv.DetectHost()
 	if err := host.ValidateSettingsFile(); err != nil {
 		return 1, err
 	}
 	projectName := hostenv.ProjectName(opts.ProjectDir)
-	instanceID, err := hostenv.InstanceID()
-	if err != nil {
-		return 1, err
+	instanceID := opts.InstanceID
+	if instanceID == "" {
+		var err error
+		if instanceID, err = hostenv.InstanceID(); err != nil {
+			return 1, err
+		}
 	}
 
 	instanceName := hostenv.InstanceName(projectName, instanceID)
@@ -90,12 +107,35 @@ func Start(opts Options) (exitCode int, err error) {
 		return 1, err
 	}
 
-	runTmpDir, err := host.CreateRunTmpDir()
+	store, err := state.NewStore(host.InstancesDir())
 	if err != nil {
 		return 1, err
 	}
+	if opts.InstanceID != "" {
+		if err := claimInstanceID(store, instanceID, instanceName); err != nil {
+			return 1, err
+		}
+	}
 
-	store, err := state.NewStore(host.InstancesDir())
+	// Held for the whole run: it is how the watchdog and GC tell a live CLI from one that has
+	// exited but not yet been reaped. Taken before the first registry write, because a state file
+	// without a held lock and without a watchdog is abandoned to a concurrent GC. For a
+	// caller-chosen ID the lock is also the real guard against a twin start in the same project:
+	// claimInstanceID cannot see one that holds the lock but has not written its state yet, and
+	// taking it before the run temp directory keeps that rejection free of leftovers.
+	releaseLiveness, err := store.HoldLiveness(instanceName)
+	if err != nil {
+		if opts.InstanceID != "" && errors.Is(err, syscall.EWOULDBLOCK) {
+			return 1, fmt.Errorf("instance ID '%s' is already in use by %s", instanceID, opts.ProjectDir)
+		}
+		return 1, err
+	}
+	defer releaseLiveness()
+	// Markers a previous run with the same instance name left behind would tear down or mislabel
+	// this one.
+	store.ClearMarkers(instanceName)
+
+	runTmpDir, err := host.CreateRunTmpDir()
 	if err != nil {
 		return 1, err
 	}
@@ -119,6 +159,7 @@ func Start(opts Options) (exitCode int, err error) {
 		LogFile:   opts.LogFile,
 		StartedAt: time.Now(),
 		Version:   version.Version,
+		Phase:     state.PhaseStarting,
 	}
 
 	// Registered before any Docker resource exists, so even a startup that aborts in the
@@ -126,17 +167,13 @@ func Start(opts Options) (exitCode int, err error) {
 	if err := store.Write(instance); err != nil {
 		return 1, err
 	}
-	// Held for the whole run: it is how the watchdog and GC tell a live CLI from one that has
-	// exited but not yet been reaped.
-	releaseLiveness, err := store.HoldLiveness(instanceName)
-	if err != nil {
-		return 1, err
-	}
-	defer releaseLiveness()
 
 	supervisor := startWatchdog(store, instance)
 	defer finishTeardown(containerEngine, host, store, instance, supervisor)
-	watchSignals(containerEngine, instance, signalled)
+	watchSignals(signals, containerEngine, store, instanceName, signalled)
+	if interrupted() {
+		return 1, errInterrupted
+	}
 
 	documents, err := loadSettingsDocument(host, opts.ProjectDir, opts.Profile)
 	if err != nil {
@@ -156,7 +193,7 @@ func Start(opts Options) (exitCode int, err error) {
 	// declines the project's grants must not have recorded one.
 	if err := trust.Gate(trust.Options{
 		ProjectDir:   opts.ProjectDir,
-		SettingsFile: host.ProjectSettingsPath(opts.ProjectDir),
+		SettingsFile: host.ProjectSettingsFile(opts.ProjectDir),
 		Document:     documents.project,
 		Store:        trust.NewStore(host.HoleDir()),
 		Interactive:  engine.IsTerminal(os.Stdin),
@@ -165,6 +202,9 @@ func Start(opts Options) (exitCode int, err error) {
 		Out:          os.Stderr,
 	}); err != nil {
 		return 1, err
+	}
+	if interrupted() {
+		return 1, errInterrupted
 	}
 
 	gitLayout := worktree.Derive(opts.ProjectDir, worktreeMode(settings), settings.Git.WorktreePool)
@@ -195,18 +235,26 @@ func Start(opts Options) (exitCode int, err error) {
 	if snapshot, err := json.Marshal(documents.merged); err == nil {
 		instance.Settings = snapshot
 		instance.SettingsFiles = documents.files
-		if host.ProjectSettingsPath(opts.ProjectDir) != projectSettingsFile(opts.ProjectDir) {
-			instance.ProjectSettingsFile = host.ProjectSettingsFile
+		if host.ProjectSettingsFile(opts.ProjectDir) != projectSettingsFile(opts.ProjectDir) {
+			instance.ProjectSettingsFile = host.ProjectSettingsOverride
 		}
 		if err := store.Write(instance); err != nil {
 			logging.Warn("could not update the instance registry: %v", err)
 		}
 	}
 	hookEnv := hookEnvironment(host, instance)
+	hookLogDir := hooks.RunLogDir(opts.LogFile)
 
-	policy, err := buildPolicy(settings, enabledAgents, opts.Unrestricted)
+	policy, base, err := buildPolicy(settings, enabledAgents, opts.Unrestricted)
 	if err != nil {
 		return 1, err
+	}
+	// Recorded before the gateway exists, so `hole modify` re-renders from what this run started
+	// with, never from settings files or allow.txt that may change while it runs.
+	instance.BaseAllow = base.allow
+	instance.BaseHostGatewayDomains = base.hostGateway
+	if err := store.Write(instance); err != nil {
+		logging.Warn("could not update the instance registry: %v", err)
 	}
 
 	setupScripts := hooks.Resolve(settings.Hooks.Setup, host, opts.ProjectDir, "setup")
@@ -263,14 +311,14 @@ func Start(opts Options) (exitCode int, err error) {
 		in:           os.Stdin,
 		out:          os.Stderr,
 		statePath:    host.AgentVersionsFile(),
-		interrupted:  func() bool { return signalled.Load() != 0 },
+		interrupted:  interrupted,
 		image:        agentImage,
 		imageFound:   agentImageFound,
 	}
 	cleanRebuild := updater.prepare(opts.Rebuild, opts.UpdateAgents, agentUpdateCheckEnabled(settings))
 	// An interrupted update build only warns — it must not fail the start — so the signal is the
 	// one thing that says the user wanted out.
-	if signalled.Load() != 0 {
+	if interrupted() {
 		return 1, fmt.Errorf("interrupted during the agent update")
 	}
 	if cleanRebuild {
@@ -286,8 +334,11 @@ func Start(opts Options) (exitCode int, err error) {
 		removeForRebuild(containerEngine, imageIdentity.Reference(), gatewayImage)
 	}
 
-	if err := hooks.RunSetupHost(hooks.Resolve(settings.Hooks.SetupHost, host, opts.ProjectDir, "setupHost"), hookEnv); err != nil {
+	if err := hooks.RunSetupHost(hooks.Resolve(settings.Hooks.SetupHost, host, opts.ProjectDir, "setupHost"), hookEnv, hookLogDir); err != nil {
 		return 1, err
+	}
+	if interrupted() {
+		return 1, errInterrupted
 	}
 
 	// Runs once per version: clears out resources an older Hole (including the bash 1.x line)
@@ -311,6 +362,9 @@ func Start(opts Options) (exitCode int, err error) {
 	instance.Subnets = []string{sandboxNet.subnet.String(), internetNet.subnet.String()}
 	if err := store.Write(instance); err != nil {
 		logging.Warn("could not update the instance registry: %v", err)
+	}
+	if interrupted() {
+		return 1, errInterrupted
 	}
 
 	gatewayIP, err := network.GatewayIP(sandboxNet.subnet)
@@ -413,10 +467,19 @@ func Start(opts Options) (exitCode int, err error) {
 		}
 	}
 
+	output := newComposeOutput(hookLogDir, opts.Debug || os.Getenv("HOLE_BUILD_PROGRESS") == "plain",
+		setupScriptFileNames(setupScripts))
+	defer output.close()
+
 	logging.Info("Starting network gateway...")
-	if err := containerEngine.ComposeUp(instanceName, composeFile, runTmpDir, opts.Rebuild, "gateway"); err != nil {
-		reportServiceStartFailure(containerEngine, instanceName, "gateway")
+	if buildFailed, err := output.up(containerEngine, instanceName, composeFile, runTmpDir, opts.Rebuild, "gateway"); err != nil {
+		if !buildFailed {
+			reportServiceStartFailure(containerEngine, instanceName, "gateway")
+		}
 		return 1, err
+	}
+	if interrupted() {
+		return 1, errInterrupted
 	}
 
 	// After the gateway (its image provably exists now, and the helper ships inside it),
@@ -448,21 +511,31 @@ func Start(opts Options) (exitCode int, err error) {
 
 	if dockerEnabled {
 		logging.Info("Starting Docker-in-Docker sidecar...")
-		if err := containerEngine.ComposeUp(instanceName, composeFile, runTmpDir, opts.Rebuild, "docker"); err != nil {
+		if _, err := output.up(containerEngine, instanceName, composeFile, runTmpDir, opts.Rebuild, "docker"); err != nil {
 			// Both services wait on the gateway's healthcheck, so a failure here is more often
 			// the gateway's than the service's own — report it first, and report both.
 			reportServiceStartFailure(containerEngine, instanceName, "gateway")
 			reportServiceStartFailure(containerEngine, instanceName, "docker")
 			return 1, err
 		}
+		if interrupted() {
+			return 1, errInterrupted
+		}
 	}
 
 	logging.Info("Starting %s agent...", opts.Agent)
 	logging.Line()
-	if err := containerEngine.ComposeUp(instanceName, composeFile, runTmpDir, opts.Rebuild, "agent"); err != nil {
-		reportServiceStartFailure(containerEngine, instanceName, "gateway")
-		reportServiceStartFailure(containerEngine, instanceName, "agent")
+	if buildFailed, err := output.up(containerEngine, instanceName, composeFile, runTmpDir, opts.Rebuild, "agent"); err != nil {
+		// A failed image build has already been reported from its own output, and there is no
+		// agent container whose logs could add anything.
+		if !buildFailed {
+			reportServiceStartFailure(containerEngine, instanceName, "gateway")
+			reportServiceStartFailure(containerEngine, instanceName, "agent")
+		}
 		return 1, err
+	}
+	if interrupted() {
+		return 1, errInterruptedBeforeAttach
 	}
 
 	agentContainer := instanceName + "-agent-1"
@@ -482,6 +555,9 @@ func Start(opts Options) (exitCode int, err error) {
 		}
 	}
 
+	// Before collectImages, which can take seconds and must not delay the status callers poll.
+	recordPhase(store, instance, state.PhaseRunning)
+
 	// Only now that a working image exists: a failed build must not have removed the previous
 	// one first.
 	collectImages(containerEngine, projectName, imageIdentity, gatewayImage)
@@ -492,17 +568,27 @@ func Start(opts Options) (exitCode int, err error) {
 	return attach(containerEngine, agentContainer), nil
 }
 
-// watchSignals installs the run-wide signal handler. It covers the whole start — including
-// the image build, where a Ctrl-C would otherwise kill the process before any resource was
-// removed. Stopping the agent container first ends an active attach, so both phases end up
-// on the same teardown path.
-//
-// Once signal.Notify is registered the runtime no longer applies the default action, so a
-// second Ctrl-C cannot interrupt teardown half-way. Immunity to a *killed* CLI needs the
-// detached watchdog of the next phase.
-func watchSignals(containerEngine *engine.Engine, instance *state.Instance, signalled *atomic.Int32) {
+// notifySignals registers the run-wide signals on a buffered channel. From then on the runtime
+// no longer applies the default action (immediate exit), and a signal that arrives before
+// watchSignals starts consuming waits in the channel.
+func notifySignals() chan os.Signal {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	return signals
+}
+
+// watchSignals consumes the run-wide signals. It covers the whole start — including the image
+// build, where a Ctrl-C would otherwise kill the process before any resource was removed. The
+// signal is recorded for Start's interruption checkpoints, the instance is marked stopping, and
+// stopping the agent container ends an active attach, so every phase ends up on the same
+// teardown path.
+//
+// A second Ctrl-C cannot interrupt teardown half-way, because the default action no longer
+// applies. Immunity to a *killed* CLI is the detached watchdog's job.
+//
+// It takes the instance name, not the instance: the struct belongs to the main goroutine.
+func watchSignals(signals chan os.Signal, containerEngine *engine.Engine, store *state.Store,
+	instanceName string, signalled *atomic.Int32) {
 	go func() {
 		sig, ok := <-signals
 		if !ok {
@@ -511,10 +597,71 @@ func watchSignals(containerEngine *engine.Engine, instance *state.Instance, sign
 		signalled.Store(int32(exitCodeForSignal(sig)))
 		logging.Line()
 		logging.Warn("received %s, destroying sandbox...", sig)
+		markStopping(store, instanceName)
 		// Stopping the agent container ends an active attach; the interrupted step then
 		// returns and the normal deferred teardown runs.
-		_ = containerEngine.ContainerStop(instance.InstanceName + "-agent-1")
+		_ = containerEngine.ContainerStop(instanceName + "-agent-1")
 	}()
+}
+
+// markStopping records the stopping status under the teardown lock, so the marker can never be
+// created after Teardown deregistered the instance. A busy lock means a teardown is running,
+// which marks stopping itself; not waiting for it keeps the agent stop that follows immediate.
+func markStopping(store *state.Store, instanceName string) {
+	unlock, busy := tryLockInstance(store.LockPath(instanceName))
+	if busy {
+		return
+	}
+	defer unlock()
+	if store.Exists(instanceName) {
+		store.MarkStopping(instanceName)
+	}
+}
+
+// recordPhase writes a phase under the instance's teardown lock and only while the instance is
+// still registered: a watchdog that already tore the sandbox down must not have it re-created.
+// It never waits for the lock — an agent that exits at once is torn down by the watchdog while
+// the CLI is here, and waiting would make attach find the container gone and lose its exit code.
+func recordPhase(store *state.Store, instance *state.Instance, phase string) {
+	unlock, busy := tryLockInstance(store.LockPath(instance.InstanceName))
+	if busy {
+		return
+	}
+	defer unlock()
+	if !store.Exists(instance.InstanceName) {
+		return
+	}
+	instance.Phase = phase
+	if err := store.Write(instance); err != nil {
+		logging.Warn("could not update the instance registry: %v", err)
+	}
+}
+
+// claimInstanceID rejects a caller-chosen ID that a live sandbox already uses, in any project,
+// before anything is created.
+//
+// Two concurrent starts with the same ID in different projects can both pass this check; the
+// same project is guarded by the liveness lock in Start. Callers generate random IDs, so the
+// cross-project race needs deliberate misuse.
+func claimInstanceID(store *state.Store, instanceID, instanceName string) error {
+	instances, err := store.List()
+	if err != nil {
+		return fmt.Errorf("check instance ID '%s': %w", instanceID, err)
+	}
+	for _, instance := range instances {
+		if instance.InstanceID != instanceID {
+			continue
+		}
+		if !store.Abandoned(instance) {
+			return fmt.Errorf("instance ID '%s' is already in use by %s", instanceID, instance.ProjectPath)
+		}
+		// Overwriting its state file would lose the record of its resources; an abandoned
+		// instance of another project shares no name with this one and is left to GC.
+		if instance.InstanceName == instanceName {
+			return fmt.Errorf("instance ID '%s' has leftovers of an abandoned sandbox; run 'hole list' to clean them up", instanceID)
+		}
+	}
+	return nil
 }
 
 // exitCodeForSignal returns the conventional 128+signal exit code.
@@ -559,7 +706,7 @@ func attach(containerEngine *engine.Engine, container string) int {
 }
 
 // projectSettingsFile is the in-repo project settings path, which HOLE_PROJECT_SETTINGS_FILE
-// may replace for the main project (see hostenv.Host.ProjectSettingsPath).
+// may replace for the main project (see hostenv.Host.ProjectSettingsFile).
 func projectSettingsFile(projectDir string) string {
 	return filepath.Join(projectDir, ".hole", "settings.json")
 }
@@ -584,7 +731,7 @@ type settingsDocuments struct {
 // project profile can extend a globally-defined one and vice versa.
 func loadSettingsDocument(host hostenv.Host, projectDir, profile string) (settingsDocuments, error) {
 	globalPath := host.GlobalSettingsFile()
-	projectPath := host.ProjectSettingsPath(projectDir)
+	projectPath := host.ProjectSettingsFile(projectDir)
 	projectLabel := "project settings (.hole/settings.json)"
 	// The override replaces the in-repo file entirely, its files.exclude included, so a human
 	// running the command by hand must see that the repository's own file was skipped.
@@ -634,45 +781,57 @@ func loadSettingsDocument(host hostenv.Host, projectDir, profile string) (settin
 	return documents, nil
 }
 
+// basePolicy is the allow list a sandbox starts with, in the canonical form state records.
+type basePolicy struct {
+	allow       []state.SourcedEntry
+	hostGateway []string
+}
+
 // buildPolicy folds every allow-list source into the gateway policy: each enabled agent's
 // built-in entries plus the user's (1.x) whitelist keys, translated into the host×ports
-// model.
-func buildPolicy(settings *config.Settings, enabledAgents []*agents.Agent, unrestricted bool) (network.Policy, error) {
+// model. It also returns the entries with their sources, for `hole modify`.
+func buildPolicy(settings *config.Settings, enabledAgents []*agents.Agent, unrestricted bool) (network.Policy, basePolicy, error) {
 	var entries []network.Entry
+	base := basePolicy{allow: []state.SourcedEntry{}}
 	for _, agent := range enabledAgents {
 		content, err := agent.AllowFile()
 		if err != nil {
-			return network.Policy{}, err
+			return network.Policy{}, basePolicy{}, err
 		}
 		parsed, err := network.ParseAllowFile(content, fmt.Sprintf("agent '%s' allow.txt", agent.Name))
 		if err != nil {
-			return network.Policy{}, err
+			return network.Policy{}, basePolicy{}, err
 		}
 		entries = append(entries, parsed...)
+		for _, entry := range parsed {
+			base.allow = append(base.allow, state.SourcedEntry{Entry: entry.String(), Source: sourceAgentPrefix + agent.Name})
+		}
 	}
 
 	for _, raw := range settings.Network.Allow {
 		entry, err := network.ParseEntry(raw)
 		if err != nil {
-			return network.Policy{}, err
+			return network.Policy{}, basePolicy{}, err
 		}
 		entries = append(entries, entry)
+		base.allow = append(base.allow, state.SourcedEntry{Entry: entry.String(), Source: SourceSettings})
 	}
 
 	var hostGateway []network.HostGatewayDomain
 	for _, raw := range settings.Network.HostGatewayDomains {
 		parsed, err := network.ParseHostGatewayDomain(raw)
 		if err != nil {
-			return network.Policy{}, err
+			return network.Policy{}, basePolicy{}, err
 		}
 		if parsed.Domain == "localhost" || parsed.Domain == "127.0.0.1" {
 			logging.Warn("hostGatewayDomains entry '%s' cannot work: inside the container that name is "+
 				"the container itself. Use 'host.internal:%d' instead.", raw, parsed.Ports[0])
 		}
 		hostGateway = append(hostGateway, parsed)
+		base.hostGateway = append(base.hostGateway, parsed.String())
 	}
 
-	return network.BuildPolicy(entries, hostGateway, unrestricted), nil
+	return network.BuildPolicy(entries, nil, hostGateway, unrestricted), base, nil
 }
 
 // resolveImage decides which image the run uses: the shared one, or a project-specific one.
@@ -889,20 +1048,31 @@ func materializeBuildContext(runTmpDir string, enabledAgents []*agents.Agent, se
 	if err := os.WriteFile(filepath.Join(setupDir, ".gitkeep"), nil, 0o644); err != nil {
 		return "", fmt.Errorf("create setup script placeholder: %w", err)
 	}
+	names := setupScriptFileNames(setupScripts)
 	for i, script := range setupScripts {
 		content, err := script.Content()
 		if err != nil {
 			return "", err
 		}
-		name := fmt.Sprintf("%03d-%s", i+1, script.Name())
-		if !strings.HasSuffix(name, ".sh") {
-			name += ".sh"
-		}
-		if err := os.WriteFile(filepath.Join(setupDir, name), content, 0o755); err != nil {
+		if err := os.WriteFile(filepath.Join(setupDir, names[i]), content, 0o755); err != nil {
 			return "", fmt.Errorf("write setup script into build context: %w", err)
 		}
 	}
 	return contextDir, nil
+}
+
+// setupScriptFileNames are the names the setup scripts get in the build context, which the
+// build's loop runs them by: numbered in order and ending in `.sh`, the loop's glob.
+func setupScriptFileNames(setupScripts []hooks.Script) []string {
+	names := make([]string, 0, len(setupScripts))
+	for i, script := range setupScripts {
+		name := fmt.Sprintf("%03d-%s", i+1, script.Name())
+		if !strings.HasSuffix(name, ".sh") {
+			name += ".sh"
+		}
+		names = append(names, name)
+	}
+	return names
 }
 
 // materializePrestartScripts copies prestart hooks into the run directory with numbered
@@ -936,7 +1106,7 @@ func writeGatewayArtifacts(runTmpDir string, policy network.Policy) (string, err
 		return "", fmt.Errorf("create gateway build context: %w", err)
 	}
 	gatewayAssets := assets.Gateway()
-	for _, name := range []string{"Dockerfile", "entrypoint.sh", "hole-bridge-netfilter"} {
+	for _, name := range []string{"Dockerfile", "entrypoint.sh", "hole-bridge-netfilter", "hole-gateway-apply", "hole-gateway-lib.sh"} {
 		data, err := fs.ReadFile(gatewayAssets, name)
 		if err != nil {
 			return "", fmt.Errorf("read embedded gateway %s: %w", name, err)

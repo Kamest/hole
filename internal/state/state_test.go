@@ -325,3 +325,123 @@ func TestLockPathIsDistinctFromStatePath(t *testing.T) {
 		t.Error("the lock file must not collide with the state file")
 	}
 }
+
+func TestPhaseRoundTripsAndLegacyFilesHaveNone(t *testing.T) {
+	s := store(t)
+	inst := instance("hole-sandbox-demo-1a2b3c4d-abc123")
+	inst.Phase = PhaseStarting
+	if err := s.Write(inst); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := s.Read(inst.InstanceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Phase != PhaseStarting {
+		t.Errorf("Phase = %q, want %q", loaded.Phase, PhaseStarting)
+	}
+
+	legacy := "hole-sandbox-demo-1a2b3c4d-legacy"
+	data := `{"instanceName":"` + legacy + `","instanceID":"legacy","agent":"claude","startedAt":"2026-01-01T00:00:00Z"}`
+	if err := os.WriteFile(s.Path(legacy), []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.Read(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Phase != "" {
+		t.Errorf("legacy Phase = %q, want empty", loaded.Phase)
+	}
+}
+
+func TestStoppingMarker(t *testing.T) {
+	s := store(t)
+	name := "hole-sandbox-demo-1a2b3c4d-abc123"
+	if s.Stopping(name) {
+		t.Error("instance is stopping before it was marked")
+	}
+	s.MarkStopping(name)
+	if !s.Stopping(name) {
+		t.Error("the stopping marker was not recorded")
+	}
+	s.Remove(name)
+	if s.Stopping(name) {
+		t.Error("the stopping marker survived Remove")
+	}
+}
+
+func TestClearMarkersKeepsLivenessAndState(t *testing.T) {
+	s := store(t)
+	inst := instance("hole-sandbox-demo-1a2b3c4d-abc123")
+	if err := s.Write(inst); err != nil {
+		t.Fatal(err)
+	}
+	release, err := s.HoldLiveness(inst.InstanceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	s.RequestTeardown(inst.InstanceName)
+	s.MarkStopping(inst.InstanceName)
+
+	s.ClearMarkers(inst.InstanceName)
+
+	if s.TeardownRequested(inst.InstanceName) || s.Stopping(inst.InstanceName) {
+		t.Error("ClearMarkers left a marker behind")
+	}
+	if !s.Exists(inst.InstanceName) {
+		t.Error("ClearMarkers removed the state file")
+	}
+	if _, err := os.Stat(s.LivenessPath(inst.InstanceName)); err != nil {
+		t.Errorf("ClearMarkers removed the liveness file: %v", err)
+	}
+	if s.CLIGone(inst.InstanceName) {
+		t.Error("the liveness lock is no longer held after ClearMarkers")
+	}
+}
+
+// `hole modify` tells an instance started by an older Hole from one with an empty base list by
+// nil versus empty, so an empty list has to survive the round trip as empty.
+func TestBaseAllowRoundTrip(t *testing.T) {
+	s := store(t)
+	empty := instance("hole-sandbox-demo-1a2b3c4d-empty1")
+	empty.BaseAllow = []SourcedEntry{}
+	if err := s.Write(empty); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := s.Read(empty.InstanceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.BaseAllow == nil {
+		t.Error("an empty base allow list read back as nil")
+	}
+
+	filled := instance("hole-sandbox-demo-1a2b3c4d-full12")
+	filled.BaseAllow = []SourcedEntry{{Entry: "github.com:443,80", Source: "settings"}}
+	filled.RuntimeAllow = []string{"example.com:443,80"}
+	if err := s.Write(filled); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.Read(filled.InstanceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.BaseAllow) != 1 || loaded.BaseAllow[0].Source != "settings" ||
+		len(loaded.RuntimeAllow) != 1 || loaded.RuntimeAllow[0] != "example.com:443,80" {
+		t.Errorf("round trip lost the allow lists: %+v", loaded)
+	}
+
+	legacy := filepath.Join(s.Dir(), "hole-sandbox-demo-1a2b3c4d-old123.json")
+	if err := os.WriteFile(legacy, []byte(`{"instanceName":"hole-sandbox-demo-1a2b3c4d-old123"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = s.Read("hole-sandbox-demo-1a2b3c4d-old123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.BaseAllow != nil {
+		t.Errorf("a state file without baseAllow read as %v, want nil", loaded.BaseAllow)
+	}
+}

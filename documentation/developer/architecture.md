@@ -11,7 +11,9 @@ everything when the agent exits.
 cmd/hole/              thin entry point: logging setup, dispatch to internal/cli
 assets/                go:embed root — agent plugins, Dockerfiles, entrypoints, schema
 internal/cli/          argument parsing, help text, command dispatch
-internal/config/       settings load/validate/merge, profiles, exclusion glob matcher
+internal/modifyui/     the `hole modify … edit` editor — the only package that uses tview
+internal/config/       settings load/validate/merge, profiles, exclusion glob matcher,
+                       settings scaffolding
 internal/hostenv/      env expansion, path pipeline, host identity, ~/.hole layout, identity
 internal/engine/       the only package that shells out to docker/podman
 internal/compose/      typed compose model (~20 fields) + YAML marshalling
@@ -20,7 +22,7 @@ internal/agents/       agent registry: embedded builtins + ~/.hole/agents user a
 internal/image/        canonical image config, manifest hashing, image identity and scope
 internal/hooks/        hook script resolution and host-side execution
 internal/sandbox/      orchestration: startup, mounts, compose generation, teardown, dump,
-                       the watchdog handoff, garbage collection, `hole list`
+                       the watchdog handoff, garbage collection, `hole list`, `hole modify`
 internal/state/        instance registry under ~/.hole/instances
 internal/trust/        per-project consent for host-affecting project settings
 internal/worktree/     git worktree detection: the libraries it implies and the worktree pool
@@ -49,7 +51,8 @@ directory to keep in sync. See [guidelines](guidelines.md#non-negotiable-rules).
   for image repositories and `hole destroy <path>`. The hash covers the path **as written**, not
   the sanitized form: sanitizing loses `_` and case, and `hole destroy` force-removes by this
   prefix — so a collision would tear down a live sandbox of a different project.
-- **Instance ID**: 6 random `[a-z0-9]` characters from `crypto/rand`.
+- **Instance ID**: 6 random `[a-z0-9]` characters from `crypto/rand`, or the caller's choice with
+  `hole start --instance-id` (same format, `hostenv.ValidateInstanceID`).
 - **Instance name**: `hole-sandbox-<project_name>-<instance_id>` — the compose project name, the
   network name prefix, and the container name prefix.
 
@@ -61,6 +64,7 @@ directory to keep in sync. See [guidelines](guidelines.md#non-negotiable-rules).
 | `~/.hole/agents/<name>/` | user-defined agents |
 | `~/.hole/instances/<instance>.json` | one file per running sandbox (plus its lock files) |
 | `~/.hole/logs/run-*.log` | per-run debug logs, ~7 day retention |
+| `~/.hole/logs/run-*/` | per-run hook logs and `build.log` ([hook logs](#hook-logs)), same retention |
 | `~/.hole/tmp/run.XXXXXX/` | per-run generated artifacts |
 | `~/.hole/state.json` | the last version that completed a run |
 | `~/.hole/trust.json` | project paths whose settings the user accepted, and what they accepted |
@@ -118,9 +122,22 @@ removed outright when it times out.
 
 ## Startup sequence
 
-1. Resolve host identity, project name and instance ID; create the run temp directory.
-2. Write the instance state file **before any Docker resource exists**, take the run's liveness
-   lock, and spawn the teardown watchdog. From here on, an abort anywhere has an owner.
+1. Register the signal handlers first (`notifySignals`): from here on a signal is buffered on a
+   channel instead of killing the process with nothing cleaned up. Resolve host identity, project
+   name and instance ID. A caller-chosen ID (`--instance-id`) is claimed before anything is
+   created (`claimInstanceID`): it is rejected when a live instance of any project uses it, or when
+   an abandoned instance with the same name still has leftovers.
+2. Take the run's liveness lock, clear stale `.abort`/`.stopping` markers a previous run with the
+   same name may have left, create the run temp directory (after the lock, so a rejected twin
+   start leaves nothing behind), write the instance state file (phase `starting`) **before any Docker
+   resource exists**, spawn the teardown watchdog, and start consuming signals
+   (`watchSignals`). From here on, an abort anywhere has an owner.
+
+   The lock comes **before** the first write: a state file without a held lock and without a
+   watchdog PID is `Abandoned`, so a concurrent `hole list` (whose GC runs on every call) would
+   tear down the instance that is starting. The lock is also what rejects a twin start with the
+   same caller-chosen ID in the same project, which `claimInstanceID` cannot see before it has
+   written its state.
 3. Validate and merge the settings documents (with the selected profile's chain, if any); resolve
    the agent registry and verify the startup agent is enabled.
 4. Resolve `cleanupHost` hooks and snapshot the merged settings into the state file, so teardown
@@ -139,7 +156,9 @@ removed outright when it times out.
 8. Materialize the build contexts and gateway configuration; generate one compose file. Directory
    masks are generated as subpaths of the mask volume unless the compose plugin is older than
    2.26; the mask volume is created right after, and only when there is a directory to mask.
-9. `compose up -d` per service: gateway → docker (if enabled) → agent. Between the gateway and the
+9. `compose up -d` per service: gateway → docker (if enabled) → agent, each through a
+   [build stream](#hook-logs) that writes `build.log`, renders the build progress and splits out
+   the setup hooks' logs. Between the gateway and the
    next service, the mask volume's subpaths are prepared and one is probe-mounted over the gateway
    image; if either fails, the volume is removed, a warning names the engine, and the compose file
    is regenerated with tmpfs masks (the gateway's definition is identical in both files, so compose
@@ -162,10 +181,85 @@ removed outright when it times out.
     for stdin.
 11. After the agent exits, mirror the watchdog's teardown progress until the instance is gone.
 
+Between the steps, **interruption checkpoints** check whether a signal arrived and, if so, end the
+start with the normal deferred teardown: after `watchSignals`, after the trust gate, after the
+agent update, after `setupHost`, after the networks, and after each `compose up` (gateway, docker,
+agent). Without them a signal that reaches only the `hole` process during a slow step — where
+stopping the not-yet-existing agent container has no effect — would let the start carry on to a
+fully running sandbox. A signal to the whole process group (a terminal Ctrl-C, or the documented
+contract for programs that drive `hole start`) also aborts the running `compose`/build child, so
+the next checkpoint is reached at once; a process-only signal waits for that step to return.
+
+Right after the mask verification of the agent (and sidecar) the phase becomes `running`
+(`recordPhase`), before image GC, which can take seconds. The write takes the teardown lock
+**without waiting** and is skipped when the lock is busy or the instance is no longer registered:
+an agent that exits immediately is already being torn down by the watchdog, and writing the full
+struct then would re-create the state file of a destroyed sandbox, while waiting for the lock
+would make `attach` find the container gone and lose the agent's exit code.
+
 The exit code the CLI reports comes from the agent *container*, not from the attach client,
 whenever the container has already stopped. An agent whose command finishes before the attach
 lands makes the runtime refuse with "cannot attach to a stopped container" and exit 1, which would
 otherwise turn a successful short-lived agent into a failed run.
+
+## Hook logs
+
+Every hook script gets one log file under `~/.hole/logs/<run log name without .log>/`
+(`hooks.RunLogDir`), named `<kind>-<NNN>-<name>.log` — `setup-host`, `build-setup`, `prestart`,
+`cleanup-host`. The format lives in `internal/hooks/hooklog.go`: a header (kind, script, start
+time, and Hole's hook variables only — never `os.Environ()`), the output, then `duration:` and a
+fixed trailer as the last line (`exit code: N`, `killed by signal: SIGTERM`, `exit code: unknown
+(<reason>)`, `not run: <error>`). The directory is `0700` and the files `0600`: hook output can
+carry tokens. It is never the project's `.hole/logs` — that is inside the sandbox's read-write
+mount (the reasoning in `dump.go`). The watchdog finds the directory from
+`state.Instance.LogFile`. `LogFileGC` removes `run-<date>-<time>-*` directories with the run logs
+and leaves every other directory alone, since `~/.hole/logs/<project>/` holds the `-n` dumps.
+
+How each hook's output reaches its log:
+
+- **`setupHost`, `cleanupHost`** — `hooks.runScript` tees stdout and stderr (one writer, so their
+  order survives) to the console and the log, and reads the exit code or the killing signal from
+  the `WaitStatus`. The streams become pipes as a result, and `os/exec` would wait for every
+  holder of a pipe — including a background process the script left running — so `WaitDelay`
+  bounds that wait, and `exec.ErrWaitDelay` counts as the script's own successful exit.
+- **`setup`** — the logs are needed most when the build fails, and a failed build leaves no image,
+  so nothing can be read out of the image afterwards. The Dockerfile loop prints
+  `::hole-hook-begin setup <name>::` / `::hole-hook-end setup <name> exit=<rc>::` around every
+  script and exits on the first failing one. `engine.ComposeUp` takes an `io.Writer` (with
+  `BUILDKIT_PROGRESS=plain` in the environment) and `sandbox.buildStream` parses the stream:
+  BuildKit's `#N [service x/y]` headers map vertex ids to services (compose builds `depends_on`
+  services in the same call, and their vertices interleave), `#N <time> text` lines of the vertex
+  that printed a begin marker feed the hook's log with the prefix stripped. Buildah's `STEP x/y:`
+  and the legacy builder's `Step x/y :` lines carry no vertex id, so there every unmarked line is
+  candidate hook output. A script whose end marker never appeared is reported only once the
+  build's outcome is known: BuildKit clips a step's log at 2 MiB (`[output clipped …]`), losing
+  the marker of a script that may have succeeded.
+- **`prestart`** — the entrypoint prints the same markers and exits with the failing script's
+  code. Teardown reads the agent container's log *before* `compose down`
+  (`engine.ContainerLogLines` streams it and stops at the entrypoint's `Starting agent CLI...`
+  line, so the agent's TUI redraws are never read and nothing the agent prints can reach the
+  logs), strips ANSI sequences and collapses `\r` redraws (the container has a TTY), and splits it.
+  The scanner already drops overwritten redraws (`scanTerminalLines`), so a progress bar running
+  for minutes without a newline cannot outgrow its buffer. These logs carry no `duration:` — they
+  are written after the fact.
+  A read-write host mount for the logs was rejected: the agent runs right after and could rewrite
+  or symlink them.
+
+`hooks.Splitter` is shared by both marker-based kinds. It accepts only the names Hole itself put
+in the build context or prestart directory, so an echoed marker can neither invent a file name nor
+escape the directory; within those names the first begin and the last end marker count. Markers
+are forgeable by the scripts, which does not matter: the loop's exit status decides the build or
+the start, never a marker. A per-build nonce was rejected because it would invalidate the hook
+layer's cache on every build.
+
+The build stream also drives the console: `logging.BuildProgress` shows a single status line
+rewritten in place on a terminal (the console handler clears it before every record and redraws it
+after, under the same mutex), one line per step elsewhere, and a permanent line per finished setup
+hook. With `-d` or `HOLE_BUILD_PROGRESS=plain` it forwards the raw stream instead. On failure the
+stream reports the failing hook with its exit code, output tail and log path — or the tail of the
+whole output when the failure is outside a hook — and `start.go` then skips
+`reportServiceStartFailure` for that service, whose container does not exist. `ImageBuild`
+(`--update-agents`) still writes to the console directly.
 
 ## Reliability: registry, watchdog, GC
 
@@ -173,8 +267,25 @@ otherwise turn a successful short-lived agent into a failed run.
 
 `~/.hole/instances/<instance>.json` records everything teardown, `hole list` and GC need:
 identity, flags, the merged settings snapshot, both process IDs, networks and subnets, the DinD
-volume, the run directory and log file, and the start time. Writes are atomic (temp file +
-rename) so a reader never sees half a file.
+volume, the run directory and log file, the start time, and the lifecycle `phase` (`starting`,
+then `running`; absent in files of older versions). Writes are atomic (temp file + rename) so a
+reader never sees half a file.
+
+It also records the egress policy the sandbox started with, for `hole modify`: `baseAllow` (each
+entry in canonical form with its source, `settings` or `agent:<name>`) and `baseHostGatewayDomains`,
+written by `Start` right after the policy is built and before the gateway exists; plus the
+`runtimeAllow` and `runtimeHostGatewayDomains` lists `hole modify` maintains. `baseAllow` is never
+omitted — `[]` when empty — so `nil` after reading reliably means "started by a Hole without
+`hole modify`", which `modify` refuses (exit 3, restart the sandbox).
+
+Next to it live small sidecar files: `.alive` (the liveness lock), `.lock` (the teardown lock),
+`.abort` (the CLI asks the watchdog to tear down now) and `.stopping`. **Stopping is a marker, not
+a phase value**: the CLI's signal goroutine must record it, but the main goroutine owns the
+`state.Instance` struct and rewrites it whole on every `store.Write`, so writing `stopping` into
+the JSON from the goroutine would be a data race and the next write would revert it. The marker is
+created under the teardown lock and only while the state file exists, and `store.Remove` deletes
+it, so it can never outlive the instance. `hole list --json` reports `stopping` when the marker
+exists, whatever the phase says.
 
 Docker labels (`hole.managed`, `hole.instance`, `hole.project`) remain the ground truth for what
 exists; the state file is the metadata cache. Its real job is letting GC distinguish an
@@ -236,9 +347,11 @@ One shared function (`sandbox.Teardown`) drives all three callers: watchdog, CLI
 for abandoned instances. It is guarded by a per-instance `flock` — a reentrancy guard, not a
 coordination mechanism; whoever loses the race finds the instance already deregistered — and
 works entirely from the state file, which it re-reads after locking, because a supervisor that
-started earlier holds a snapshot with no networks in it.
+started earlier holds a snapshot with no networks in it. Its first act under the lock is dropping
+the `.stopping` marker, before any slow step, so a caller polling `hole list --json` sees
+`stopping` within a poll interval whichever path tears down.
 
-Phases: `-n` dump → `compose down --remove-orphans` (fileless, `-p` only, so teardown never
+Phases: prestart hook logs → `-n` dump → `compose down --remove-orphans` (fileless, `-p` only, so teardown never
 depends on generated files) → registry mirror detach → explicit removal of both networks with an
 attached-container force fallback → DinD volume → mask volume → registry mirror stop when this was the last
 instance → `cleanupHost` hooks → run directory → state file → a final verification pass that
@@ -258,13 +371,15 @@ version's "cleanup seems random" symptom: `compose down` only ran when the final
 had succeeded, so an earlier failure leaked containers, and the network removal then failed
 invisibly because containers were still attached.
 
-Signals (INT/TERM/HUP) reach the CLI for the whole run, including the image build: they stop the
-agent container, which ends an active attach, let the interrupted step return, and set the exit
+Signals (INT/TERM/HUP) reach the CLI for the whole run, including the image build: they mark the
+instance stopping, stop the agent container, which ends an active attach, let the interrupted step
+return (the next [interruption checkpoint](#startup-sequence) ends the start), and set the exit
 code to the conventional 130/143/129.
 
 ### Garbage collection
 
-GC runs on every `start` and `list`. It is the backstop for the one case the watchdog cannot
+GC runs on every `start` and `list` (except `hole list --no-gc`, for callers that poll; it still
+filters abandoned instances out of its output). It is the backstop for the one case the watchdog cannot
 cover — CLI and watchdog killed at once — and it is deliberately conservative, because anything
 it removes might belong to a concurrent start:
 
@@ -275,12 +390,45 @@ it removes might belong to a concurrent start:
 | Containers | stopped sandbox containers whose instance has no state file, no running sibling and **no networks left** (compose has a window where networks exist but containers do not) |
 | Volumes | per-instance DinD and mask volumes whose instance has neither network nor container — volume prune has no age filter, so sibling liveness is the age proxy |
 | Run directories | `~/.hole/tmp/run.*` older than a day that no registered instance owns |
-| Run logs | older than 7 days |
+| Run logs | run log files and `run-<date>-<time>-*` hook log directories older than 7 days |
 | Update references | `hole-sandbox/agent-update:<instanceID>` and `:<instanceID>-base` whose instance ID is not in the registry — an update interrupted by a kill; skipped when the registry cannot be read |
 
 Image GC is separate and runs only *after* the agent service is up — never before, or a failed
 build could have destroyed the last working image. See
 [configuration](configuration.md#image-identity-and-scope).
+
+### Runtime changes and the instance lock
+
+`hole modify` ([networking](networking.md#runtime-changes-hole-modify)) writes the instance state
+of a sandbox it does not own, so it serializes with teardown through the per-instance teardown
+lock — taken **blocking**, because a modify racing a teardown must wait for it and then report the
+sandbox as gone. Before taking it, `modify` checks the instance *without* the lock and refuses
+(exit 3) one that is `Abandoned`, still `starting`, stopping or teardown-requested; under the lock
+it re-reads the state and checks the same conditions again, plus that the state file still exists.
+The unlocked pre-check matters: `recordPhase` and `markStopping` use `tryLockInstance` and *skip*
+their write when the lock is busy, so a modify holding the lock during the `starting → running`
+transition could leave the sandbox reported as `starting` forever. Once `running` is recorded no
+other phase write remains (teardown marks stopping itself).
+
+The change is a delta (values to add and remove), recomputed against the re-read state under the
+lock, so two concurrent modifies cannot overwrite each other. State with the new runtime lists is
+written **before** the gateway apply; on a failed apply the previous lists are written back
+(exit 4). A crash in between leaves state ahead of the gateway, which the next apply repairs,
+because every apply sends the complete configuration.
+
+## `hole list --json` is a public contract
+
+The JSON output is consumed by other programs (the JetBrains plugin first), which detect support
+by running it once and rely on its fields from then on. It is built from its own type,
+`sandbox.listEntry`, never by encoding `state.Instance`: the registry file is internal and can be
+refactored freely, the list schema cannot. Fields are only ever added, never renamed or removed.
+`status` is derived at listing time (`instanceStatus`: marker, then phase, legacy → `running`),
+`settings` is the slice the table joins with `+` (a path can contain `+`, so it is never split
+from a string), and `networks`/`settingsFiles` are `[]`, never `null`. `runtimeEntryCount` is read
+from the state only (`len(runtimeAllow) + len(runtimeHostGatewayDomains)`), never from the gateway.
+The `hole modify … list --json` and `list-blocked --json` documents follow the same rules
+(`internal/cli/modify.go`). Logging goes to stderr, so
+stdout carries only the document, encoded completely before anything is written.
 
 ## Destroy
 
