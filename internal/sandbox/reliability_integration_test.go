@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -643,5 +644,147 @@ func TestStartRejectsATwinInstanceIDWithoutLeftovers(t *testing.T) {
 	}
 	if store.Exists(instanceName) {
 		t.Error("a rejected start registered the instance")
+	}
+}
+
+// Regression: the watchdog tore the sandbox down the instant the agent stopped, while the CLI was
+// still on its way to attach. An agent that exits at once then had its container removed before
+// the CLI could read the exit code, and `hole start` reported the attach client's 1 instead.
+//
+// Teardown's `compose down` never touches the plain `docker run` container used here, so the
+// tests watch the registry: the stopping marker is the first thing Teardown drops, the
+// deregistration the last.
+func TestWatchdogKeepsAStoppedAgentUntilTheCLILetsGo(t *testing.T) {
+	containerEngine := testEngine(t)
+
+	tests := []struct {
+		name   string
+		suffix string
+		octet  int
+		// grace replaces agentStoppedGrace when set.
+		grace time.Duration
+		// letGo is what the CLI does once the hold window has passed; nil for a wedged CLI.
+		letGo func(store *state.Store, instanceName string, release func())
+	}{
+		{
+			name: "cli asks", suffix: "wdask0", octet: 180,
+			letGo: func(store *state.Store, instanceName string, _ func()) { store.RequestTeardown(instanceName) },
+		},
+		{
+			name: "cli dies", suffix: "wddie0", octet: 190,
+			letGo: func(_ *state.Store, _ string, release func()) { release() },
+		},
+		{
+			name: "cli wedged", suffix: "wdwdg0", octet: 210,
+			grace: 4 * time.Second,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.grace > 0 {
+				previous := agentStoppedGrace
+				agentStoppedGrace = test.grace
+				t.Cleanup(func() { agentStoppedGrace = previous })
+			}
+
+			host, store := testHostAndStore(t)
+			instance := fabricate(t, containerEngine, store, test.suffix, test.octet, false)
+
+			// The test plays the live CLI; flock is per open file description, so the
+			// watchdog's in-process probe still finds the lock held.
+			holdRelease, err := store.HoldLiveness(instance.InstanceName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(holdRelease) }
+
+			agentContainer := instance.InstanceName + "-agent-1"
+			_ = containerEngine.ContainerRemove(agentContainer)
+			if err := containerEngine.RunQuiet("run", "-d", "--name", agentContainer, "alpine:3.19", "true"); err != nil {
+				release()
+				t.Skipf("could not create a container: %v", err)
+			}
+			t.Cleanup(func() { _ = containerEngine.ContainerRemove(agentContainer) })
+			if _, err := containerEngine.ContainerWait(agentContainer); err != nil {
+				release()
+				t.Skipf("container did not exit: %v", err)
+			}
+
+			// The watchdog's debug records are the only sign that it has seen the agent stop;
+			// against a slow daemon its inspect and wait can outlast a fixed hold window.
+			logFile := filepath.Join(t.TempDir(), "run.log")
+			restoreLogging, err := logging.Setup(logging.Options{LogFile: logFile, Quiet: true, NoColor: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				restoreLogging()
+				// Leave the package logger writing nowhere rather than to a closed file.
+				if reset, err := logging.Setup(logging.Options{Quiet: true}); err == nil {
+					_ = reset
+				}
+			})
+
+			done := make(chan struct{})
+			go func() {
+				supervise(containerEngine, host, store, instance)
+				close(done)
+			}()
+			// Runs before the container and resource cleanups, so a failing test never leaves
+			// supervise tearing down resources that are already gone.
+			t.Cleanup(func() {
+				store.RequestTeardown(instance.InstanceName)
+				release()
+				select {
+				case <-done:
+				case <-time.After(60 * time.Second):
+					t.Error("the watchdog did not return after the CLI let go")
+				}
+			})
+
+			assertHeld := func() {
+				t.Helper()
+				select {
+				case <-done:
+					t.Fatal("the watchdog returned while the CLI still held the stopped agent")
+				default:
+				}
+				if store.Stopping(instance.InstanceName) || !store.Exists(instance.InstanceName) {
+					t.Fatal("the watchdog tore down a stopped agent before the CLI let go")
+				}
+			}
+			seenDeadline := time.Now().Add(60 * time.Second)
+			for {
+				assertHeld()
+				written, _ := os.ReadFile(logFile)
+				if strings.Contains(string(written), "waiting for the CLI to read its exit code") {
+					break
+				}
+				if time.Now().After(seenDeadline) {
+					t.Fatal("the watchdog never noticed that the agent had stopped")
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			holdUntil := time.Now().Add(3 * watchdogPoll)
+			for time.Now().Before(holdUntil) {
+				assertHeld()
+				time.Sleep(50 * time.Millisecond)
+			}
+
+			if test.letGo != nil {
+				test.letGo(store, instance.InstanceName, release)
+			}
+
+			select {
+			case <-done:
+			case <-time.After(60 * time.Second):
+				t.Fatal("the watchdog did not tear down after the CLI let go")
+			}
+			if store.Exists(instance.InstanceName) {
+				t.Error("the instance is still registered after the watchdog returned")
+			}
+		})
 	}
 }

@@ -192,10 +192,14 @@ the next checkpoint is reached at once; a process-only signal waits for that ste
 
 Right after the mask verification of the agent (and sidecar) the phase becomes `running`
 (`recordPhase`), before image GC, which can take seconds. The write takes the teardown lock
-**without waiting** and is skipped when the lock is busy or the instance is no longer registered:
-an agent that exits immediately is already being torn down by the watchdog, and writing the full
-struct then would re-create the state file of a destroyed sandbox, while waiting for the lock
-would make `attach` find the container gone and lose the agent's exit code.
+**without waiting** and is skipped when the lock is busy or the instance is no longer registered.
+The watchdog keeps a stopped agent until the CLI asks for teardown (see [Watchdog](#watchdog)), so
+an agent that exits at once no longer races this write. Two holders remain: a concurrent
+`hole modify` briefly holding the lock, and the watchdog's grace fallback tearing down a CLI that
+seems wedged. (GC takes the lock only to tear down an abandoned instance, which a live CLI's is
+not.) Writing the full struct after such a teardown would re-create the state file of a destroyed
+sandbox, and waiting for the lock would delay `attach` behind it — in the fallback case until the
+container is gone, and the agent's exit code with it.
 
 The exit code the CLI reports comes from the agent *container*, not from the attach client,
 whenever the container has already stopped. An agent whose command finishes before the attach
@@ -307,11 +311,23 @@ teardown is immune to terminal lifecycle, because signals cannot reach a setsid'
 
 Watchdog logic: until the agent container has **started**, watch the CLI's liveness lock — a
 startup that aborts before any container must still have its partial resources removed. Once it
-has started, `docker wait` it, but keep watching the lock and the abort marker alongside: tear
-down when the container stops, when the CLI asks, or when the CLI dies, whichever comes first. The
-CLI drops the abort marker on early failure so the common failure case has no polling lag. (A
-marker rather than a signal: a signal sent in the milliseconds before the watchdog installs its
-handler is lost, or worse, kills it.)
+has started, `docker wait` it, but keep watching the lock and the abort marker alongside. The CLI
+asking or dying tears down at once. **The container stopping tears down only if the CLI is gone**;
+otherwise the watchdog waits for the CLI's request, because the CLI reads the agent's exit code
+from the container, and an agent that exits at once can stop before the CLI has even attached.
+Removing it then made `hole start` report the attach client's 1 instead of the agent's own code.
+Every CLI path past the watchdog's spawn ends in `finishTeardown`, which drops the abort marker, so
+the wait is normally well under a second. A CLI that is alive but wedged (stuck in a hung engine
+call before `attach`) is bounded by `agentStoppedGrace`, the same 3 minutes the CLI waits on the
+watchdog. The watchdog also returns when the instance leaves the registry, torn down by GC or the
+CLI's fallback. The CLI drops the abort marker on early failure too, so the common failure case
+has no polling lag. (A marker rather than a signal: a signal sent in the milliseconds before the
+watchdog installs its handler is lost, or worse, kills it.)
+
+The observable consequence: `hole list --json` keeps reporting `running` for a sandbox whose agent
+has already exited, until the CLI asks for teardown — normally well under a second, at most the
+grace period for a wedged CLI. The e2e phase test (`starting,running,stopping`) stops the sandbox
+with SIGINT and is unaffected.
 
 **The liveness lock has to be polled in the second phase too**, not just the first. A SIGKILLed
 CLI runs no cleanup of its own, so waiting only on the container means relying on the CLI's death
