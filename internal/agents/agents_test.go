@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -193,6 +194,33 @@ func TestPinnedNodeVersionMatchesTheInstallScript(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// Claude Code no longer honours a trust entry above the git root, so the baked `/` entry cannot
+// stop its trust dialog; the sandbox flag must reach both the exec'd agent and shells.
+func TestClaudeRunsAsSandboxed(t *testing.T) {
+	registry, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	agent, ok := registry.Get("claude")
+	if !ok {
+		t.Fatal("builtin agent claude missing from the registry")
+	}
+	command, err := agent.Command()
+	if err != nil {
+		t.Fatalf("claude command: %v", err)
+	}
+	if !slices.Contains(command, "CLAUDE_CODE_SANDBOXED=1") {
+		t.Errorf("claude command %q does not set CLAUDE_CODE_SANDBOXED=1", command)
+	}
+	scripts, err := agent.InstallScripts()
+	if err != nil {
+		t.Fatalf("claude install scripts: %v", err)
+	}
+	if !strings.Contains(string(scripts["install-user.sh"]), "export CLAUDE_CODE_SANDBOXED=1") {
+		t.Errorf("claude install-user.sh does not export CLAUDE_CODE_SANDBOXED=1 for shells")
 	}
 }
 

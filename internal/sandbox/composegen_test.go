@@ -519,7 +519,7 @@ func TestAgentCommandAppendsSettingsArgsBeforeCLIArgs(t *testing.T) {
 	}
 	// Settings args come first and the CLI args last, so an ad-hoc flag wins on a repeated
 	// value flag; only the started agent's args apply.
-	want := []string{"claude", "--dangerously-skip-permissions", "--model", "opus", "--model", "sonnet"}
+	want := []string{"env", "CLAUDE_CODE_SANDBOXED=1", "claude", "--dangerously-skip-permissions", "--model", "opus", "--model", "sonnet"}
 	if !reflect.DeepEqual(command, want) {
 		t.Errorf("command = %v, want %v", command, want)
 	}
@@ -551,7 +551,7 @@ func TestAgentCommandKeepsRepeatedFlagsWithoutAProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"claude", "--dangerously-skip-permissions", "--allowedTools", "Bash", "--allowedTools", "Read"}
+	want := []string{"env", "CLAUDE_CODE_SANDBOXED=1", "claude", "--dangerously-skip-permissions", "--allowedTools", "Bash", "--allowedTools", "Read"}
 	if !reflect.DeepEqual(command, want) {
 		t.Errorf("command = %v, want %v", command, want)
 	}
@@ -901,7 +901,7 @@ func TestConfiguredValuesExpandHostVariables(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantCommand := []string{
-		"claude", "--dangerously-skip-permissions",
+		"env", "CLAUDE_CODE_SANDBOXED=1", "claude", "--dangerously-skip-permissions",
 		"--config", "/host/projects/demo/agent.json",
 		// Untouched: the shell already expanded what the user left unquoted, so expanding a
 		// command-line argument again would defeat their quoting.

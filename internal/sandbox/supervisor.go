@@ -30,6 +30,10 @@ const (
 	watchdogComponent = "watchdog"
 )
 
+// agentStoppedGrace bounds how long the watchdog keeps a stopped agent for a CLI that is alive
+// but never asks for teardown. A var so the tests can shorten it.
+var agentStoppedGrace = relayTimeout
+
 // supervisor is the CLI's handle on the detached watchdog process.
 type supervisor struct {
 	pid int
@@ -166,6 +170,15 @@ func RunWatchdog(instanceName string) int {
 	// cannot reach it anyway; this is belt and braces.
 	signal.Ignore(syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
+	return supervise(containerEngine, host, store, instance)
+}
+
+// supervise is the watchdog's decision loop, separate from process setup so the integration
+// tests can drive it in-process.
+func supervise(containerEngine *engine.Engine, host hostenv.Host, store *state.Store,
+	instance *state.Instance) int {
+
+	instanceName := instance.InstanceName
 	agentContainer := instanceName + "-agent-1"
 	logging.Debug("watchdog supervising %s", instanceName)
 
@@ -192,8 +205,12 @@ func RunWatchdog(instanceName string) int {
 		time.Sleep(watchdogPoll)
 	}
 
-	// Phase 2: the agent exists — tear down when it stops, or when the CLI that owns it is
-	// gone, whichever happens first.
+	// Phase 2: the agent has started. While the CLI is alive, the agent stopping is not a
+	// teardown trigger — the CLI's request is. The CLI reads the agent's exit code from the
+	// container, which may not have happened yet when the agent exits at once, so removing it
+	// then makes `hole start` report the attach client's status instead. The CLI asks once it
+	// is done (finishTeardown) on every path; agentStoppedGrace bounds a CLI that is alive but
+	// wedged.
 	//
 	// The CLI's liveness has to be polled here, not merely trusted to stop the container. A
 	// SIGKILLed CLI runs no cleanup, so the container only stops by side effect: the attach
@@ -209,21 +226,44 @@ func RunWatchdog(instanceName string) int {
 			logging.Debug("waiting for %s ended with: %v", agentContainer, err)
 		}
 	}()
+	// Select on a copy: the goroutine's deferred close still needs the original channel.
+	agentStopped := stopped
+	var agentStoppedAt time.Time
 	for {
 		select {
-		case <-stopped:
-			Teardown(containerEngine, host, store, instance)
-			return 0
+		case <-agentStopped:
+			if store.CLIGone(instanceName) {
+				logging.Debug("%s stopped and the CLI is gone", agentContainer)
+				Teardown(containerEngine, host, store, instance)
+				return 0
+			}
+			logging.Debug("%s stopped; waiting for the CLI to read its exit code", agentContainer)
+			agentStopped = nil // a nil channel never fires again
+			agentStoppedAt = time.Now()
 		case <-time.After(watchdogPoll):
+			if !store.Exists(instanceName) {
+				// Torn down by someone else (GC, the CLI's in-process fallback).
+				return 0
+			}
 			// Both of phase 1's triggers apply here too: an explicit request, and a CLI that
 			// died without being able to make one.
+			agentState := "was still running"
+			if !agentStoppedAt.IsZero() {
+				agentState = "had stopped"
+			}
 			if store.TeardownRequested(instanceName) {
-				logging.Debug("the CLI asked for teardown while %s was still running", agentContainer)
+				logging.Debug("the CLI asked for teardown while %s %s", agentContainer, agentState)
 				Teardown(containerEngine, host, store, instance)
 				return 0
 			}
 			if store.CLIGone(instanceName) {
-				logging.Debug("the CLI is gone while %s is still running", agentContainer)
+				logging.Debug("the CLI is gone while %s %s", agentContainer, agentState)
+				Teardown(containerEngine, host, store, instance)
+				return 0
+			}
+			if !agentStoppedAt.IsZero() && time.Since(agentStoppedAt) > agentStoppedGrace {
+				logging.Debug("%s stopped %s ago and the CLI has not asked for teardown; tearing down",
+					agentContainer, agentStoppedGrace)
 				Teardown(containerEngine, host, store, instance)
 				return 0
 			}
