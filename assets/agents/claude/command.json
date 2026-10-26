@@ -1,1 +1,1 @@
-["claude", "--dangerously-skip-permissions"]
+["env", "CLAUDE_CODE_SANDBOXED=1", "claude", "--dangerously-skip-permissions"]

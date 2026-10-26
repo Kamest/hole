@@ -513,6 +513,8 @@ api.my-agent.example
 *.my-agent.example
 ```
 
+A custom agent that wraps Claude Code should start it the way the builtin does, `["env", "CLAUDE_CODE_SANDBOXED=1", "claude", "--dangerously-skip-permissions"]`; without the variable, Claude asks whether to trust the project folder on every start.
+
 Names must match `^[a-z0-9][a-z0-9-]*$`, and a name that collides with a builtin agent is an error rather than a silent override. Custom agents work everywhere builtins do, including `container.enabledAgents`. Editing a custom agent's files rebuilds the image automatically — except its update files (`update-*.sh`, `version.json`), which are not part of the image.
 
 To take part in [agent updates](#updating-agents), add an update script and a `version.json`:
@@ -640,6 +642,8 @@ hole start claude . --trust-project -- -p "run the test suite"
 ```
 
 The flag accepts *whatever the file asks for at that moment* — network keys, host mounts, `hooks.setupHost`, all of it. A CI script that carries it because the project only widens `network.allow` today also pre-approves a host hook the repository adds tomorrow.
+
+Inside the sandbox, Claude Code's own "Do you trust this folder?" prompt is switched off (Hole starts it with `CLAUDE_CODE_SANDBOXED=1`). The project's `.claude/` settings — permission rules, hooks, MCP servers — therefore apply without that prompt, just as they would after answering yes to it. They can only act inside the sandbox; the agent already runs with `--dangerously-skip-permissions`, and anything that reaches beyond the sandbox goes through Hole's own prompt described above.
 
 ### File exclusions
 
