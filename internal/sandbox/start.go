@@ -620,8 +620,9 @@ func markStopping(store *state.Store, instanceName string) {
 
 // recordPhase writes a phase under the instance's teardown lock and only while the instance is
 // still registered: a watchdog that already tore the sandbox down must not have it re-created.
-// It never waits for the lock — an agent that exits at once is torn down by the watchdog while
-// the CLI is here, and waiting would make attach find the container gone and lose its exit code.
+// It never waits for the lock: a concurrent `hole modify` may hold it briefly, and the watchdog's
+// grace fallback may be tearing down a stopped agent, in which case waiting would make attach
+// find the container gone and lose its exit code.
 func recordPhase(store *state.Store, instance *state.Instance, phase string) {
 	unlock, busy := tryLockInstance(store.LockPath(instance.InstanceName))
 	if busy {
