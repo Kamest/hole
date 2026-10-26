@@ -16,6 +16,7 @@ type editorHarness struct {
 	screen  tcell.SimulationScreen
 	editor  *editor
 	done    chan int
+	handled chan struct{}
 	exited  bool
 	code    int
 	applied [][2][]string
@@ -28,7 +29,7 @@ func startEditor(t *testing.T, ctx EditContext, applyErr error) *editorHarness {
 		t.Fatal(err)
 	}
 	screen.SetSize(100, 20)
-	h := &editorHarness{t: t, screen: screen, done: make(chan int, 1)}
+	h := &editorHarness{t: t, screen: screen, done: make(chan int, 1), handled: make(chan struct{}, 1)}
 	ctx.Screen = screen
 	if ctx.Canonical == nil {
 		ctx.Canonical = func(raw string) (string, error) {
@@ -43,6 +44,14 @@ func startEditor(t *testing.T, ctx EditContext, applyErr error) *editorHarness {
 		return applyErr
 	}
 	h.editor = newEditor(ctx)
+	capture := h.editor.app.GetInputCapture()
+	h.editor.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == syncKey {
+			h.handled <- struct{}{}
+			return nil
+		}
+		return capture(event)
+	})
 	go func() { h.done <- h.editor.run() }()
 	h.sync()
 	return h
@@ -65,10 +74,25 @@ func (h *editorHarness) sync() {
 	}
 }
 
+// syncKey is a key the editor never binds. Keys reach the event loop in injection order, while
+// QueueUpdate takes a separate channel the loop may serve first, so only a key injected after
+// another proves that one was handled.
+const syncKey = tcell.KeyF64
+
 func (h *editorHarness) key(key tcell.Key, r rune) {
+	h.t.Helper()
 	h.screen.InjectKey(key, r, tcell.ModNone)
-	time.Sleep(10 * time.Millisecond)
-	h.sync()
+	if h.exited {
+		return
+	}
+	h.screen.InjectKey(syncKey, 0, tcell.ModNone)
+	select {
+	case <-h.handled:
+	case code := <-h.done:
+		h.exited, h.code = true, code
+	case <-time.After(5 * time.Second):
+		h.t.Fatal("the editor did not handle the key")
+	}
 }
 
 func (h *editorHarness) typeText(text string) {
