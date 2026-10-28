@@ -51,6 +51,7 @@ Table of contents:
   - [Profiles](#profiles)
   - [Configuration examples](#configuration-examples)
 - [Logs](#logs)
+- [Projects using Hole](#project-using-hole)
 
 ## Usage
 
@@ -1294,3 +1295,7 @@ Then connect to `host.internal:5432` from inside the sandbox.
 | `~/.hole/trust.json` | which projects' settings you accepted, see [project trust](#project-trust) |
 
 Run with `-d` to see debug output on the console as well.
+
+## Projects using Hole
+
+- [Jetbrains IDE plugin for Hole](https://github.com/lukashornych/jetbrains-ide-hole-plugin)
