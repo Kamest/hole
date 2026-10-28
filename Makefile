@@ -44,6 +44,7 @@ lint:
 	# host-only build would not notice a break on the other one until release.
 	CGO_ENABLED=0 GOOS=linux go build ./...
 	CGO_ENABLED=0 GOOS=darwin go build ./...
+	scripts/generate-adr-index.sh --check
 	@if command -v golangci-lint >/dev/null 2>&1; then golangci-lint run; \
 	else echo "golangci-lint not installed, skipping"; fi
 

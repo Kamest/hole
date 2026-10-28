@@ -135,4 +135,6 @@ Triage strings worth recognising:
 - Schema updated for any new setting, with tests.
 - README updated for user-facing changes; these docs updated for internals; MIGRATION.md updated if
   1.x behavior changed.
+- Decision record written if the work clears the bar in `.claude/rules/adr.md`, its plan deleted,
+  and the index regenerated with `scripts/generate-adr-index.sh`.
 - Conventional commit subject (`feat:` bumps the minor version).

@@ -13,6 +13,7 @@ conventions the code must follow, see [guidelines](guidelines.md); for task-shap
 | **git** | the checkout, and part of the unit suite | `internal/worktree` shells out to `git`; its tests skip without it. |
 | **docker or podman + the compose plugin** | `make itest`, `make e2e`, manual runs | Hole's own runtime requirement, see the [README](../../README.md#installation). `engine.Detect` verifies `<binary> compose version` works, not just that the binary exists. |
 | **golangci-lint** | optional, part of `make lint` | The repo ships **no** `.golangci.yml`, so the linter runs on its defaults. CI pins a version; `.hole/setup.sh` installs the same one, so a different local install can disagree with CI. |
+| **python3** | part of `make lint` | `scripts/generate-adr-index.sh` is a bash wrapper around an inline Python script; standard library only. |
 | **goreleaser** | optional | Only to reproduce the `release-config` CI job locally — see [build & release](build-and-release.md). |
 
 Dependencies of the Go module itself are kept deliberately few — every new one has to be worth more
@@ -167,6 +168,7 @@ go vet -tags integration ./...
 go vet -tags e2e ./...
 CGO_ENABLED=0 GOOS=linux go build ./...    # both shipped platforms
 CGO_ENABLED=0 GOOS=darwin go build ./...
+scripts/generate-adr-index.sh --check # ADR index current, record front matter valid
 golangci-lint run                     # skipped with a notice if not installed
 ```
 
@@ -174,7 +176,10 @@ The three `go vet` invocations are not redundant: plain `go vet ./...` never com
 build-tagged test files, so a broken integration or e2e test survives it. The two cross-compiles
 are there because `internal/engine`'s terminal check is GOOS-specific (`tty_linux.go`,
 `tty_darwin.go`), so a host-only build would not notice a break on the other platform until
-GoReleaser hit it at release time. `make fmt` rewrites files in place.
+GoReleaser hit it at release time. The ADR check fails when the index table in
+`documentation/adr/README.md` is stale or a record's front matter is invalid; run
+`scripts/generate-adr-index.sh` without arguments to regenerate it. `make fmt` rewrites files in
+place.
 
 ## Golden files
 
